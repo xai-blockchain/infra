@@ -79,11 +79,46 @@ common_packages:
   - libssl-dev
 
 # =============================================================================
+# XAI Port Assignments (12xxx range for nodes)
+# =============================================================================
+# Core Node Ports - Per-node overrides in inventory/testnet.yml
+# Default base ports for development/single node:
+default_rpc_port: 12545
+default_p2p_port: 12333
+
+# Sentry nodes (public-facing)
+sentry1_rpc_port: 12570
+sentry1_p2p_port: 12371
+sentry2_rpc_port: 12571
+sentry2_p2p_port: 12372
+
+# =============================================================================
+# Supporting Service Ports
+# =============================================================================
+# Blockscout Explorer (Docker - primary explorer)
+blockscout_frontend_port: 3001
+blockscout_backend_port: 4000
+blockscout_postgres_port: 5432
+rpc_adapter_port: 8545
+
+# Legacy Python Explorer (backup/secondary)
+legacy_explorer_port: 12080          # xai-explorer.service
+legacy_explorer_backend_port: 12084  # xai-explorer-backend.service (indexer API)
+
+# Other Services
+faucet_port: 12081
+websocket_port: 8766
+websocket_metrics_port: 8767
+graphql_port: 8083
+
+# =============================================================================
 # Monitoring Ports
 # =============================================================================
 node_exporter_port: 9100
 node_exporter_version: "1.7.0"
 xai_metrics_port: 9302
+prometheus_port: 9090
+grafana_port: 3000
 prometheus_scrape_interval: 15s
 
 # =============================================================================

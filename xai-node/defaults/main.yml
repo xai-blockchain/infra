@@ -8,8 +8,11 @@ daemon_user: xai
 daemon_home: /home/xai/xai
 venv_path: "{{ daemon_home }}/venv"
 
-rpc_port: 8545
-p2p_port: 8333
-ws_port: 8765
+# XAI port range: 12xxx (to avoid conflicts with other chains)
+# Actual ports are set per-node in inventory/testnet.yml
+# These defaults are for local development only
+rpc_port: 12545
+p2p_port: 12333
+ws_port: 8766
 
 service_name: xai
