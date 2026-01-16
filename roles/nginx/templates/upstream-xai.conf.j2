@@ -1,0 +1,17 @@
+# Ansible-managed upstream definitions for XAI
+# This file adds/updates upstream blocks without touching existing server configs
+
+upstream ansible_xai_rpc {
+    server 127.0.0.1:{{ rpc_port | default(8545) }};
+    keepalive 32;
+}
+
+upstream ansible_xai_ws {
+    server 127.0.0.1:{{ ws_port | default(8765) }};
+    keepalive 32;
+}
+
+upstream ansible_xai_graphql {
+    server 127.0.0.1:{{ graphql_port | default(4102) }};
+    keepalive 32;
+}

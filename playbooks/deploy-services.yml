@@ -1,0 +1,13 @@
+---
+# Deploy XAI supporting services (explorer, faucet, indexer, etc.)
+# Usage: ansible-playbook -i inventory/testnet.yml playbooks/deploy-services.yml
+
+- name: Deploy XAI supporting services
+  hosts: services
+  become: yes
+  roles:
+    - common
+    - role: nginx
+      tags: [nginx]
+    - role: monitoring
+      tags: [monitoring]

@@ -1,0 +1,35 @@
+# Managed by Ansible - DO NOT EDIT MANUALLY
+# XAI Prometheus configuration
+
+global:
+  scrape_interval: {{ prometheus_scrape_interval }}
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:{{ prometheus_port }}']
+
+  # Node Exporters (XAI servers)
+  - job_name: 'node'
+    static_configs:
+      - targets:
+          - '{{ xai_primary_vpn }}:{{ node_exporter_port }}'
+          - '{{ services_vpn }}:{{ node_exporter_port }}'
+        labels:
+          group: 'xai-nodes'
+
+  # XAI node metrics
+  - job_name: 'xai'
+    static_configs:
+      - targets:
+          - '{{ xai_primary_vpn }}:9100'
+        labels:
+          chain: 'xai'
+          server: 'primary'
+      - targets:
+          - '{{ services_vpn }}:9100'
+        labels:
+          chain: 'xai'
+          server: 'services'

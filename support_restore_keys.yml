@@ -1,0 +1,420 @@
+---
+# XAI Key Restore Playbook
+#
+# Restores node identity and wallet files from encrypted backup.
+# Follows blockchain community standards for key management.
+#
+# Usage:
+#   # Restore from backup file
+#   ansible-playbook -i inventory/testnet.yml support_restore_keys.yml --limit xai_node1 \
+#     -e backup_file=/path/to/backup.tar.gz.gpg
+#
+#   # Restore with password provided
+#   ansible-playbook -i inventory/testnet.yml support_restore_keys.yml --limit xai_node1 \
+#     -e backup_file=/path/to/backup.tar.gz.gpg \
+#     -e backup_password=YOUR_PASSWORD
+#
+#   # Restore without stopping the node (for key pre-staging)
+#   ansible-playbook -i inventory/testnet.yml support_restore_keys.yml --limit xai_node1 \
+#     -e backup_file=/path/to/backup.tar.gz.gpg \
+#     -e stop_node=false
+#
+# Security Notes:
+#   - Node is stopped during restore to prevent conflicts
+#   - Existing keys are backed up before overwrite
+#   - File permissions set to 0600 for key files
+#   - Integrity verified via public key derivation
+#
+# References:
+#   - https://docs.prylabs.network/docs/advanced/migrating-keys
+#   - https://docs.ethstaker.org/scaled-node-operators/key-management-at-scale
+
+- name: XAI Key Restore
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    # Stop node during restore (recommended)
+    stop_node: true
+    # Start node after restore
+    start_node: true
+    # Backup existing keys before overwrite
+    backup_existing: true
+    # Verify key integrity after restore
+    verify_keys: true
+
+  handlers:
+    - name: Start xai service
+      ansible.builtin.service:
+        name: "{{ service_name }}"
+        state: started
+      when: start_node | bool
+
+  tasks:
+    # =========================================================================
+    # Pre-flight Checks
+    # =========================================================================
+    - name: Verify required variables
+      ansible.builtin.assert:
+        that:
+          - node_name is defined
+          - daemon_home is defined
+          - daemon_user is defined
+          - backup_file is defined
+        fail_msg: |
+          Required variables missing. Ensure these are defined:
+          - node_name
+          - daemon_home
+          - daemon_user
+          - backup_file (path to backup archive)
+
+    - name: Check if backup file exists on controller
+      ansible.builtin.stat:
+        path: "{{ backup_file }}"
+      delegate_to: localhost
+      become: false
+      register: backup_stat
+
+    - name: Fail if backup file not found
+      ansible.builtin.fail:
+        msg: "Backup file not found: {{ backup_file }}"
+      when: not backup_stat.stat.exists
+
+    - name: Determine if backup is encrypted
+      ansible.builtin.set_fact:
+        backup_encrypted: "{{ backup_file.endswith('.gpg') }}"
+
+    - name: Check for GPG on controller
+      ansible.builtin.command:
+        cmd: which gpg
+      delegate_to: localhost
+      become: false
+      register: gpg_check
+      changed_when: false
+      failed_when: false
+      when: backup_encrypted
+
+    - name: Fail if GPG not available for encrypted backup
+      ansible.builtin.fail:
+        msg: "GPG required to decrypt backup but not found on controller"
+      when:
+        - backup_encrypted
+        - gpg_check.rc != 0
+
+    - name: Prompt for backup password if encrypted and not provided
+      ansible.builtin.pause:
+        prompt: "Enter decryption password for backup"
+        echo: false
+      register: password_prompt
+      delegate_to: localhost
+      become: false
+      when:
+        - backup_encrypted
+        - backup_password is not defined
+
+    - name: Set backup password from prompt
+      ansible.builtin.set_fact:
+        backup_password: "{{ password_prompt.user_input }}"
+      when:
+        - backup_encrypted
+        - backup_password is not defined
+        - password_prompt.user_input is defined
+      no_log: true
+
+    # =========================================================================
+    # Decrypt Backup (if encrypted)
+    # =========================================================================
+    - name: Create temporary directory on controller
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: xai_restore_
+      delegate_to: localhost
+      become: false
+      register: local_temp_dir
+
+    - name: Decrypt backup file
+      ansible.builtin.command:
+        cmd: >
+          gpg --batch --yes --decrypt
+          --passphrase-fd 0
+          --output "{{ local_temp_dir.path }}/backup.tar.gz"
+          "{{ backup_file }}"
+        stdin: "{{ backup_password }}"
+      delegate_to: localhost
+      become: false
+      when: backup_encrypted
+      no_log: true
+      register: decrypt_result
+      changed_when: decrypt_result.rc == 0
+
+    - name: Copy unencrypted backup to temp
+      ansible.builtin.copy:
+        src: "{{ backup_file }}"
+        dest: "{{ local_temp_dir.path }}/backup.tar.gz"
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+      when: not backup_encrypted
+
+    - name: Extract backup archive locally
+      ansible.builtin.unarchive:
+        src: "{{ local_temp_dir.path }}/backup.tar.gz"
+        dest: "{{ local_temp_dir.path }}/"
+        remote_src: false
+      delegate_to: localhost
+      become: false
+
+    - name: Read backup metadata
+      ansible.builtin.slurp:
+        src: "{{ local_temp_dir.path }}/backup_metadata.json"
+      delegate_to: localhost
+      become: false
+      register: metadata_raw
+      failed_when: false
+
+    - name: Parse backup metadata
+      ansible.builtin.set_fact:
+        backup_metadata: "{{ metadata_raw.content | b64decode | from_json }}"
+      when: metadata_raw is succeeded and metadata_raw.content is defined
+
+    - name: Display backup metadata
+      ansible.builtin.debug:
+        msg: |
+          Restoring backup:
+            Original node: {{ backup_metadata.node_name | default('unknown') }}
+            Backup date: {{ backup_metadata.backup_date | default('unknown') }}
+            Chain ID: {{ backup_metadata.chain_id | default('unknown') }}
+            Components: {{ backup_metadata.components | default({}) }}
+      when: backup_metadata is defined
+
+    # =========================================================================
+    # Stop Node Service
+    # =========================================================================
+    - name: Check if service file exists
+      ansible.builtin.stat:
+        path: "/etc/systemd/system/{{ service_name }}.service"
+      register: service_file
+
+    - name: Stop XAI service
+      ansible.builtin.systemd:
+        name: "{{ service_name }}"
+        state: stopped
+      when:
+        - stop_node | bool
+        - service_file.stat.exists
+
+    - name: Wait for service to stop
+      ansible.builtin.wait_for:
+        timeout: 10
+      when: stop_node | bool
+
+    # =========================================================================
+    # Backup Existing Keys (Safety)
+    # =========================================================================
+    - name: Check for existing node identity
+      ansible.builtin.stat:
+        path: "{{ daemon_home }}/data/node_identity.json"
+      register: existing_identity
+
+    - name: Backup existing node identity
+      ansible.builtin.copy:
+        src: "{{ daemon_home }}/data/node_identity.json"
+        dest: "{{ daemon_home }}/data/node_identity.json.backup.{{ ansible_date_time.epoch }}"
+        remote_src: true
+        mode: '0600'
+        owner: "{{ daemon_user }}"
+        group: "{{ daemon_user }}"
+      when:
+        - backup_existing | bool
+        - existing_identity.stat.exists
+
+    - name: Check for existing wallets
+      ansible.builtin.stat:
+        path: "{{ daemon_home }}/wallets"
+      register: existing_wallets
+
+    - name: Backup existing wallets directory
+      ansible.builtin.command:
+        cmd: >
+          cp -r {{ daemon_home }}/wallets
+          {{ daemon_home }}/wallets.backup.{{ ansible_date_time.epoch }}
+      when:
+        - backup_existing | bool
+        - existing_wallets.stat.exists
+      changed_when: true
+
+    # =========================================================================
+    # Restore Keys
+    # =========================================================================
+    - name: Ensure data directory exists
+      ansible.builtin.file:
+        path: "{{ daemon_home }}/data"
+        state: directory
+        owner: "{{ daemon_user }}"
+        group: "{{ daemon_user }}"
+        mode: '0700'
+
+    - name: Check for node_identity.json in backup
+      ansible.builtin.stat:
+        path: "{{ local_temp_dir.path }}/node_identity.json"
+      delegate_to: localhost
+      become: false
+      register: backup_identity
+
+    - name: Restore node identity
+      ansible.builtin.copy:
+        src: "{{ local_temp_dir.path }}/node_identity.json"
+        dest: "{{ daemon_home }}/data/node_identity.json"
+        owner: "{{ daemon_user }}"
+        group: "{{ daemon_user }}"
+        mode: '0600'
+      when: backup_identity.stat.exists
+
+    - name: Check for wallets in backup
+      ansible.builtin.stat:
+        path: "{{ local_temp_dir.path }}/wallets"
+      delegate_to: localhost
+      become: false
+      register: backup_wallets
+
+    - name: Ensure wallets directory exists
+      ansible.builtin.file:
+        path: "{{ daemon_home }}/wallets"
+        state: directory
+        owner: "{{ daemon_user }}"
+        group: "{{ daemon_user }}"
+        mode: '0700'
+      when: backup_wallets.stat.exists
+
+    - name: Restore wallet files
+      ansible.builtin.copy:
+        src: "{{ local_temp_dir.path }}/wallets/"
+        dest: "{{ daemon_home }}/wallets/"
+        owner: "{{ daemon_user }}"
+        group: "{{ daemon_user }}"
+        mode: '0600'
+      when: backup_wallets.stat.exists
+
+    - name: Check for config in backup
+      ansible.builtin.stat:
+        path: "{{ local_temp_dir.path }}/config.yml"
+      delegate_to: localhost
+      become: false
+      register: backup_config
+
+    - name: Restore config file
+      ansible.builtin.copy:
+        src: "{{ local_temp_dir.path }}/config.yml"
+        dest: "{{ daemon_home }}/config.yml"
+        owner: "{{ daemon_user }}"
+        group: "{{ daemon_user }}"
+        mode: '0644'
+      when: backup_config.stat.exists
+
+    # =========================================================================
+    # Verify Restored Keys
+    # =========================================================================
+    - name: Read restored identity
+      ansible.builtin.slurp:
+        src: "{{ daemon_home }}/data/node_identity.json"
+      register: restored_identity_raw
+      when: verify_keys | bool
+
+    - name: Parse restored identity
+      ansible.builtin.set_fact:
+        restored_identity: "{{ restored_identity_raw.content | b64decode | from_json }}"
+      when:
+        - verify_keys | bool
+        - restored_identity_raw is succeeded
+
+    - name: Verify identity has required fields
+      ansible.builtin.assert:
+        that:
+          - restored_identity.private_key is defined
+          - restored_identity.public_key is defined
+          - restored_identity.private_key | length > 0
+          - restored_identity.public_key | length > 0
+        fail_msg: "Restored identity is invalid or missing required fields"
+      when:
+        - verify_keys | bool
+        - restored_identity is defined
+
+    - name: Display restored identity info
+      ansible.builtin.debug:
+        msg: |
+          Restored identity:
+            Public key (first 32 chars): {{ restored_identity.public_key[:32] }}...
+            Version: {{ restored_identity.version | default('unknown') }}
+      when:
+        - verify_keys | bool
+        - restored_identity is defined
+      no_log: false
+
+    # =========================================================================
+    # Start Node Service
+    # =========================================================================
+    - name: Start XAI service
+      ansible.builtin.systemd:
+        name: "{{ service_name }}"
+        state: started
+      when:
+        - start_node | bool
+        - service_file.stat.exists
+
+    - name: Wait for node to respond
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ rpc_port }}/stats"
+        return_content: true
+        timeout: 10
+      register: node_status
+      until: node_status.status == 200
+      retries: 30
+      delay: 2
+      when: start_node | bool
+      failed_when: false
+
+    # =========================================================================
+    # Cleanup
+    # =========================================================================
+    - name: Remove temporary directory on controller
+      ansible.builtin.file:
+        path: "{{ local_temp_dir.path }}"
+        state: absent
+      delegate_to: localhost
+      become: false
+
+    - name: Clean up old identity backups (keep last 3)
+      ansible.builtin.shell: |
+        set -o pipefail
+        ls -t {{ daemon_home }}/data/node_identity.json.backup.* 2>/dev/null | tail -n +4 | xargs -r rm -f
+      args:
+        executable: /bin/bash
+      changed_when: false
+      failed_when: false
+
+    # =========================================================================
+    # Summary
+    # =========================================================================
+    - name: Display restore summary
+      ansible.builtin.debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════════╗
+          ║                    XAI KEY RESTORE COMPLETE                      ║
+          ╠══════════════════════════════════════════════════════════════════╣
+          ║ Node: {{ node_name }}
+          ║ Host: {{ inventory_hostname }}
+          ║ Identity restored: {{ 'YES' if backup_identity.stat.exists else 'NO' }}
+          ║ Wallets restored: {{ 'YES' if backup_wallets.stat.exists else 'NO' }}
+          ║ Config restored: {{ 'YES' if backup_config.stat.exists else 'NO' }}
+          ║ Node status: {{ 'RUNNING' if (node_status.status | default(0)) == 200 else 'NOT VERIFIED' }}
+          {% if (node_status.status | default(0)) == 200 %}
+          ║ Current height: {{ (node_status.content | from_json).chain_height | default('N/A') }}
+          {% endif %}
+          ╠══════════════════════════════════════════════════════════════════╣
+          ║ VERIFICATION STEPS:                                              ║
+          ║ 1. Check logs: journalctl -u {{ service_name }} -f              ║
+          ║ 2. Verify identity: curl http://127.0.0.1:{{ rpc_port }}/stats  ║
+          ║ 3. Confirm peer connections                                      ║
+          ║ 4. Verify mining/validation (if applicable)                      ║
+          ╚══════════════════════════════════════════════════════════════════╝

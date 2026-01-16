@@ -1,0 +1,130 @@
+---
+# XAI Snapshot Restore Playbook
+#
+# Downloads and restores a snapshot from R2 artifacts.
+# Usage:
+#   ansible-playbook -i inventory/testnet.yml playbooks/snapshot-restore.yml --limit xai_node1
+#   ansible-playbook -i inventory/testnet.yml playbooks/snapshot-restore.yml --limit xai_node1 -e snapshot_url=https://...
+#
+# Variables:
+#   snapshot_url: Optional specific snapshot URL (default: latest from R2)
+#   backup_existing: Whether to backup existing data (default: true)
+
+- name: XAI Snapshot Restore
+  hosts: all
+  become: true
+  vars:
+    artifacts_base_url: "https://artifacts.xaiblockchain.com"
+    chain_id: "xai-mvp-testnet-1"
+    backup_existing: true
+
+  tasks:
+    - name: Get latest snapshot info from R2
+      ansible.builtin.uri:
+        url: "{{ artifacts_base_url }}/{{ chain_id }}/snapshots/latest.json"
+        return_content: true
+      register: snapshot_info
+      when: snapshot_url is not defined
+
+    - name: Set snapshot URL from latest.json
+      ansible.builtin.set_fact:
+        snapshot_url: "{{ (snapshot_info.content | from_json).url }}"
+        snapshot_height: "{{ (snapshot_info.content | from_json).height }}"
+      when: snapshot_url is not defined and snapshot_info is succeeded
+
+    - name: Display snapshot info
+      ansible.builtin.debug:
+        msg: "Restoring snapshot: {{ snapshot_url | default('custom URL') }} (height: {{ snapshot_height | default('unknown') }})"
+
+    - name: Stop XAI service
+      ansible.builtin.service:
+        name: "{{ service_name }}"
+        state: stopped
+
+    - name: Wait for service to stop
+      ansible.builtin.wait_for:
+        path: "/proc/{{ xai_pid.stdout }}"
+        state: absent
+        timeout: 60
+      failed_when: false
+      when: xai_pid is defined
+
+    - name: Check if data directory exists
+      ansible.builtin.stat:
+        path: "{{ daemon_home }}/data"
+      register: data_dir_stat
+
+    - name: Backup existing data directory
+      ansible.builtin.command:
+        cmd: "mv {{ daemon_home }}/data {{ daemon_home }}/data.backup.{{ ansible_date_time.epoch }}"
+      when:
+        - backup_existing | bool
+        - data_dir_stat.stat.exists
+      changed_when: true
+
+    - name: Create fresh data directory
+      ansible.builtin.file:
+        path: "{{ daemon_home }}/data"
+        state: directory
+        owner: "{{ daemon_user }}"
+        group: "{{ daemon_user }}"
+        mode: '0755'
+
+    - name: Download snapshot
+      ansible.builtin.get_url:
+        url: "{{ snapshot_url }}"
+        dest: "/tmp/xai-snapshot.tar.lz4"
+        mode: '0644'
+        timeout: 600
+      register: download_result
+
+    - name: Extract snapshot with lz4
+      ansible.builtin.shell: |
+        set -o pipefail
+        lz4 -d /tmp/xai-snapshot.tar.lz4 | tar -xf - -C {{ daemon_home }}/data
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Set correct ownership
+      ansible.builtin.file:
+        path: "{{ daemon_home }}/data"
+        owner: "{{ daemon_user }}"
+        group: "{{ daemon_user }}"
+        recurse: true
+
+    - name: Clean up downloaded snapshot
+      ansible.builtin.file:
+        path: "/tmp/xai-snapshot.tar.lz4"
+        state: absent
+
+    - name: Start XAI service
+      ansible.builtin.service:
+        name: "{{ service_name }}"
+        state: started
+
+    - name: Wait for node to start responding
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ rpc_port }}/stats"
+        return_content: true
+      register: node_status
+      until: node_status.status == 200
+      retries: 30
+      delay: 2
+
+    - name: Display restore result
+      ansible.builtin.debug:
+        msg: |
+          Snapshot restore complete!
+          Node: {{ node_name }}
+          Current height: {{ (node_status.content | from_json).chain_height }}
+          Peers: {{ (node_status.content | from_json).peers }}
+
+    - name: Clean up old backups (keep last 2)
+      ansible.builtin.shell: |
+        set -o pipefail
+        ls -dt {{ daemon_home }}/data.backup.* 2>/dev/null | tail -n +3 | xargs -r rm -rf || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+      when: backup_existing | bool

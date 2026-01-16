@@ -1,0 +1,25 @@
+---
+# =============================================================================
+# XAI Ansible Galaxy Dependencies
+# =============================================================================
+# Install with: ansible-galaxy install -r requirements.yml
+#
+# Collections provide modules used by XAI playbooks:
+#   - community.general: ufw, timezone, and other system modules
+#   - ansible.posix: sysctl, synchronize, and POSIX-specific modules
+#   - community.docker: Docker management (for Blockscout)
+
+collections:
+  - name: community.general
+    version: ">=8.0.0"
+  - name: ansible.posix
+    version: ">=1.5.0"
+  - name: community.docker
+    version: ">=3.8.0"
+
+# External roles (optional, for extended functionality)
+# roles:
+#   - name: cloudalchemy.node_exporter
+#     version: "1.0.0"
+#   - name: geerlingguy.docker
+#     version: "6.1.0"

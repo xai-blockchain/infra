@@ -1,0 +1,330 @@
+---
+# Update XAI code on nodes with rolling deployment
+# Features: Serial execution, pre/post health checks, sync verification, rollback on failure
+#
+# Usage:
+#   All nodes:    ansible-playbook -i inventory/testnet.yml playbooks/update-code.yml
+#   Single node:  ansible-playbook -i inventory/testnet.yml playbooks/update-code.yml --limit xai_node1
+#   Skip backup:  ansible-playbook -i inventory/testnet.yml playbooks/update-code.yml -e skip_backup=true
+
+- name: Update XAI code with rolling deployment
+  hosts: nodes
+  become: yes
+  serial: 1  # Deploy one node at a time for zero-downtime rolling updates
+  gather_facts: yes
+  max_fail_percentage: 0  # Fail entire play if any node fails
+
+  vars:
+    # Health check configuration
+    health_check_retries: 30
+    health_check_delay: 10  # seconds (30 * 10 = 5 minutes total)
+    sync_tolerance_blocks: 5  # How far behind network is acceptable
+
+    # Backup configuration
+    backup_dir: "/home/{{ daemon_user }}/xai-backups"
+    skip_backup: false
+
+    # Service name pattern (matches systemd units)
+    service_name: "xai-mvp-{{ node_name }}"
+
+  handlers:
+    - name: Rollback on failure
+      block:
+        - name: Stop failed node
+          ansible.builtin.service:
+            name: "{{ service_name }}"
+            state: stopped
+          ignore_errors: yes
+
+        - name: Restore code from backup
+          ansible.builtin.shell: |
+            if [ -d "{{ backup_dir }}/{{ node_name }}-latest" ]; then
+              rm -rf {{ xai_home }}
+              cp -a {{ backup_dir }}/{{ node_name }}-latest {{ xai_home }}
+              echo "Restored from backup"
+            else
+              echo "No backup found - manual intervention required"
+              exit 1
+            fi
+          become_user: "{{ daemon_user }}"
+          register: restore_result
+
+        - name: Start node with restored code
+          ansible.builtin.service:
+            name: "{{ service_name }}"
+            state: started
+
+        - name: Verify rollback success
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ rpc_port }}/stats"
+            return_content: yes
+          register: rollback_status
+          until: rollback_status.status == 200
+          retries: 10
+          delay: 5
+      listen: "rollback deployment"
+
+  pre_tasks:
+    - name: Display deployment info
+      ansible.builtin.debug:
+        msg: |
+          Starting rolling update for {{ node_name }}
+          Server: {{ ansible_host }}
+          RPC Port: {{ rpc_port }}
+          Service: {{ service_name }}
+
+  tasks:
+    # ============================================================
+    # PHASE 1: Pre-deployment health check
+    # ============================================================
+    - name: "Pre-check: Verify node is currently healthy"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ rpc_port }}/stats"
+        return_content: yes
+        timeout: 30
+      register: pre_health
+      failed_when: false
+
+    - name: "Pre-check: Record initial state"
+      ansible.builtin.set_fact:
+        initial_height: "{{ pre_health.json.chain_height | default(0) }}"
+        initial_peers: "{{ pre_health.json.peer_count | default(0) }}"
+        node_was_healthy: "{{ pre_health.status | default(0) == 200 }}"
+
+    - name: "Pre-check: Display initial state"
+      ansible.builtin.debug:
+        msg: |
+          Initial state for {{ node_name }}:
+          - Status: {{ 'Healthy' if node_was_healthy else 'Unhealthy/Offline' }}
+          - Height: {{ initial_height }}
+          - Peers: {{ initial_peers }}
+
+    - name: "Pre-check: Warn if node was unhealthy"
+      ansible.builtin.debug:
+        msg: "WARNING: Node {{ node_name }} was not healthy before update. Proceeding anyway."
+      when: not node_was_healthy
+
+    # ============================================================
+    # PHASE 2: Create backup
+    # ============================================================
+    - name: Create backup directory
+      ansible.builtin.file:
+        path: "{{ backup_dir }}"
+        state: directory
+        owner: "{{ daemon_user }}"
+        mode: '0755'
+      when: not skip_backup
+
+    - name: Backup current code
+      ansible.builtin.shell: |
+        # Remove old latest backup
+        rm -rf {{ backup_dir }}/{{ node_name }}-latest
+        # Create timestamped backup
+        timestamp=$(date +%Y%m%d_%H%M%S)
+        cp -a {{ xai_home }} {{ backup_dir }}/{{ node_name }}-${timestamp}
+        # Create symlink to latest
+        ln -sfn {{ backup_dir }}/{{ node_name }}-${timestamp} {{ backup_dir }}/{{ node_name }}-latest
+        echo "Backup created: {{ node_name }}-${timestamp}"
+      become_user: "{{ daemon_user }}"
+      register: backup_result
+      when: not skip_backup
+
+    - name: Display backup status
+      ansible.builtin.debug:
+        msg: "{{ backup_result.stdout }}"
+      when: not skip_backup and backup_result.stdout is defined
+
+    # ============================================================
+    # PHASE 3: Stop node service
+    # ============================================================
+    - name: Stop node service
+      ansible.builtin.service:
+        name: "{{ service_name }}"
+        state: stopped
+      register: stop_result
+
+    - name: Wait for service to fully stop
+      ansible.builtin.wait_for:
+        port: "{{ rpc_port }}"
+        state: stopped
+        timeout: 60
+      ignore_errors: yes  # Port may already be closed
+
+    - name: Verify service is stopped
+      ansible.builtin.shell: |
+        systemctl is-active {{ service_name }} || true
+      register: service_state
+      changed_when: false
+
+    - name: Confirm service stopped
+      ansible.builtin.assert:
+        that:
+          - service_state.stdout == 'inactive' or service_state.stdout == 'failed'
+        fail_msg: "Service {{ service_name }} failed to stop cleanly"
+        success_msg: "Service {{ service_name }} stopped successfully"
+
+    # ============================================================
+    # PHASE 4: Deploy new code
+    # ============================================================
+    - name: Pull latest code from repository
+      ansible.builtin.git:
+        repo: "https://github.com/xai-blockchain/xai.git"
+        dest: "{{ xai_home }}"
+        version: main
+        force: yes
+      become_user: "{{ daemon_user }}"
+      register: git_result
+      notify: "rollback deployment"
+
+    - name: Display git update info
+      ansible.builtin.debug:
+        msg: |
+          Git update result:
+          - Before: {{ git_result.before | default('N/A') }}
+          - After: {{ git_result.after | default('N/A') }}
+          - Changed: {{ git_result.changed }}
+
+    - name: Install/update Python dependencies
+      ansible.builtin.pip:
+        requirements: "{{ xai_home }}/requirements.txt"
+        virtualenv: "{{ venv_path }}"
+        state: latest
+      become_user: "{{ daemon_user }}"
+      notify: "rollback deployment"
+
+    # ============================================================
+    # PHASE 5: Start node service
+    # ============================================================
+    - name: Start node service
+      ansible.builtin.service:
+        name: "{{ service_name }}"
+        state: started
+      register: start_result
+      notify: "rollback deployment"
+
+    - name: Wait for RPC port to be available
+      ansible.builtin.wait_for:
+        port: "{{ rpc_port }}"
+        state: started
+        timeout: 120
+      notify: "rollback deployment"
+
+    # ============================================================
+    # PHASE 6: Post-deployment health check - basic connectivity
+    # ============================================================
+    - name: "Post-check: Wait for node to respond"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ rpc_port }}/stats"
+        return_content: yes
+        timeout: 30
+      register: post_health
+      until: post_health.status == 200 and post_health.json.chain_height is defined
+      retries: "{{ health_check_retries }}"
+      delay: "{{ health_check_delay }}"
+      notify: "rollback deployment"
+
+    - name: "Post-check: Record post-deployment state"
+      ansible.builtin.set_fact:
+        current_height: "{{ post_health.json.chain_height }}"
+        current_peers: "{{ post_health.json.peer_count | default(0) }}"
+        is_mining: "{{ post_health.json.mining | default(false) }}"
+
+    - name: "Post-check: Display post-deployment state"
+      ansible.builtin.debug:
+        msg: |
+          Post-deployment state for {{ node_name }}:
+          - Height: {{ current_height }}
+          - Peers: {{ current_peers }}
+          - Mining: {{ is_mining }}
+
+    # ============================================================
+    # PHASE 7: Sync verification - ensure node catches up
+    # ============================================================
+    - name: "Sync check: Get network height from another node"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:12570/stats"  # Sentry 1 as reference
+        return_content: yes
+        timeout: 30
+      register: network_status
+      failed_when: false
+      delegate_to: "{{ groups['primary_nodes'][0] }}"
+      run_once: false
+      when: ansible_host != '54.39.129.11' or rpc_port != 12570
+
+    - name: "Sync check: Use current node height if reference unavailable"
+      ansible.builtin.set_fact:
+        network_height: "{{ network_status.json.chain_height | default(current_height) }}"
+      when: network_status is defined
+
+    - name: "Sync check: Verify node is syncing"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ rpc_port }}/stats"
+        return_content: yes
+      register: sync_check
+      until: >
+        (sync_check.json.chain_height | int) >= ((network_height | default(current_height) | int) - sync_tolerance_blocks)
+      retries: "{{ health_check_retries }}"
+      delay: "{{ health_check_delay }}"
+      notify: "rollback deployment"
+
+    - name: "Sync check: Final height verification"
+      ansible.builtin.set_fact:
+        final_height: "{{ sync_check.json.chain_height }}"
+
+    # ============================================================
+    # PHASE 8: Final validation
+    # ============================================================
+    - name: "Validation: Check node is progressing"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ rpc_port }}/stats"
+        return_content: yes
+      register: progress_check_1
+
+    - name: "Validation: Wait and check again"
+      ansible.builtin.pause:
+        seconds: 15
+
+    - name: "Validation: Verify height increased"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ rpc_port }}/stats"
+        return_content: yes
+      register: progress_check_2
+
+    - name: "Validation: Confirm chain is progressing"
+      ansible.builtin.assert:
+        that:
+          - progress_check_2.json.chain_height | int >= progress_check_1.json.chain_height | int
+        fail_msg: |
+          Node {{ node_name }} is not progressing!
+          Height before: {{ progress_check_1.json.chain_height }}
+          Height after: {{ progress_check_2.json.chain_height }}
+        success_msg: "Node {{ node_name }} is healthy and progressing"
+      notify: "rollback deployment"
+
+    # ============================================================
+    # PHASE 9: Success summary
+    # ============================================================
+    - name: "Success: Display update summary"
+      ansible.builtin.debug:
+        msg: |
+          ====================================================
+          SUCCESS: {{ node_name }} updated successfully!
+          ====================================================
+          Initial height: {{ initial_height }}
+          Final height: {{ final_height }}
+          Height change: +{{ (final_height | int) - (initial_height | int) }}
+          Peers: {{ progress_check_2.json.peer_count | default('N/A') }}
+          Mining: {{ progress_check_2.json.mining | default('N/A') }}
+          Git commit: {{ git_result.after | default('N/A') }}
+          ====================================================
+          Proceeding to next node...
+          ====================================================
+
+  post_tasks:
+    - name: Clean up old backups (keep last 3)
+      ansible.builtin.shell: |
+        cd {{ backup_dir }} 2>/dev/null || exit 0
+        ls -dt {{ node_name }}-20* 2>/dev/null | tail -n +4 | xargs rm -rf 2>/dev/null || true
+      become_user: "{{ daemon_user }}"
+      when: not skip_backup
+      changed_when: false

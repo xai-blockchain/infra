@@ -1,0 +1,29 @@
+---
+# XAI Node Role Defaults
+# All variables prefixed with xai_node_ per ansible-lint convention
+
+# Chain configuration
+xai_node_chain_id: "xai-mvp-testnet-1"
+xai_node_chain_name: "XAI"
+
+# Python configuration
+xai_node_python_version: "3.12"
+xai_node_venv_path: "/home/{{ daemon_user }}/xai/venv"
+xai_node_src: "/home/{{ daemon_user }}/xai"
+
+# Service configuration
+xai_node_service_name: "xai-mvp-{{ node_name }}"
+
+# Environment variables for XAI node
+xai_node_env:
+  XAI_CHAIN_ID: "{{ xai_node_chain_id }}"
+  XAI_FAST_MINING: "1"
+  XAI_ALLOW_EMPTY_MINING: "true"
+  XAI_FINALITY_ENABLED: "true"
+
+# Firewall
+xai_node_ufw_enabled: true
+xai_node_vpn_network: "10.10.0.0/24"
+
+# Artifacts
+xai_node_artifacts_base_url: "https://artifacts.xaiblockchain.com"

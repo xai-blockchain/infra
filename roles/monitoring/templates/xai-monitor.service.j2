@@ -1,0 +1,85 @@
+#
+# xai-monitor.service - XAI Node Monitor
+#
+# Monitors XAI node health and sends alerts on issues.
+# Checks chain sync, peer connectivity, finality, and resource usage.
+#
+# Managed by Ansible - do not edit directly
+#
+# Variables:
+#   venv_path   - Python virtual environment path
+#   daemon_user - User to run the service as
+#   node_name   - Node identifier for monitoring context
+#
+
+[Unit]
+Description=XAI Node Monitor ({{ node_name }})
+Documentation=https://docs.xaiblockchain.com/monitoring
+After=network-online.target xai-mvp-{{ node_name }}.service
+Wants=network-online.target
+BindsTo=xai-mvp-{{ node_name }}.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User={{ daemon_user }}
+Group={{ daemon_user }}
+
+# Working directory
+WorkingDirectory={{ venv_path | dirname }}
+
+# Environment
+Environment="PATH={{ venv_path }}/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+Environment="XAI_NODE_NAME={{ node_name }}"
+Environment="XAI_CHAIN_ID=xai-mvp-testnet-1"
+
+# Configuration file (optional)
+EnvironmentFile=-/etc/xai/monitor.conf
+
+# Main process
+ExecStart={{ venv_path }}/bin/python -m xai.monitoring.node_monitor \
+    --node-name {{ node_name }} \
+    --check-interval 30 \
+    --alert-threshold 3 \
+    --enable-discord-alerts \
+    --enable-slack-alerts
+
+# Health check
+ExecStartPre=/bin/sleep 10
+ExecStartPost={{ venv_path }}/bin/python -c "print('XAI monitor {{ node_name }} started')"
+
+# Restart policy
+Restart=always
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+
+# Allow network access for alerts
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Resource limits
+MemoryMax=512M
+CPUQuota=50%
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=xai-monitor-{{ node_name }}
+
+# Watchdog
+WatchdogSec=120
+NotifyAccess=main
+
+[Install]
+WantedBy=multi-user.target

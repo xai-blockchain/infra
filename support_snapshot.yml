@@ -1,0 +1,158 @@
+---
+# XAI Snapshot Creation - Automated snapshot generation
+#
+# Creates compressed snapshots of node data and optionally uploads to R2.
+# Includes cron job for daily automated snapshots.
+#
+# Usage:
+#   ansible-playbook -i inventory/testnet.yml support_snapshot.yml --limit xai_node1
+#   ansible-playbook -i inventory/testnet.yml support_snapshot.yml --limit xai_node1 -e upload_to_r2=true
+
+- name: XAI Snapshot Creation
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    snapshot_dir: "{{ snapshot_dir | default('/home/' + daemon_user + '/xai-snapshots') }}"
+    enable_cron: "{{ enable_cron | default(true) }}"
+    upload_to_r2: "{{ upload_to_r2 | default(false) }}"
+    snapshot_retention: "{{ snapshot_retention | default(3) }}"
+    artifacts_bucket: "{{ artifacts_bucket | default('xai-testnet-artifacts') }}"
+
+  tasks:
+    - name: Create snapshot directory
+      ansible.builtin.file:
+        path: "{{ snapshot_dir }}"
+        state: directory
+        owner: "{{ daemon_user }}"
+        group: "{{ daemon_user }}"
+        mode: '0755'
+
+    - name: Install lz4 compression tool
+      ansible.builtin.apt:
+        name: lz4
+        state: present
+
+    - name: Deploy snapshot script
+      ansible.builtin.copy:
+        content: |
+          #!/bin/bash
+          set -euo pipefail
+
+          # Configuration
+          CHAIN_ID="{{ chain_id }}"
+          DAEMON_HOME="{{ daemon_home }}"
+          SNAPSHOT_DIR="{{ snapshot_dir }}"
+          SERVICE_NAME="{{ service_name }}"
+          RPC_PORT="{{ rpc_port }}"
+          RETENTION={{ snapshot_retention }}
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+          # Get current height from XAI /stats endpoint
+          HEIGHT=$(curl -s http://127.0.0.1:${RPC_PORT}/stats | jq -r '.chain_height')
+
+          if [[ -z "$HEIGHT" || "$HEIGHT" == "null" ]]; then
+            echo "[$(date)] ERROR: Could not get chain height from node"
+            exit 1
+          fi
+
+          SNAPSHOT_NAME="${CHAIN_ID}-${HEIGHT}-${TIMESTAMP}.tar.lz4"
+
+          echo "[$(date)] Creating XAI snapshot at height ${HEIGHT}..."
+
+          # Stop the service
+          sudo systemctl stop ${SERVICE_NAME}
+          sleep 5
+
+          # Create snapshot of data directory
+          cd ${DAEMON_HOME}
+          tar -cvf - data | lz4 -9 > ${SNAPSHOT_DIR}/${SNAPSHOT_NAME}
+
+          # Restart the service
+          sudo systemctl start ${SERVICE_NAME}
+
+          # Create latest symlink
+          ln -sf ${SNAPSHOT_DIR}/${SNAPSHOT_NAME} ${SNAPSHOT_DIR}/latest.tar.lz4
+
+          # Calculate size
+          SIZE_BYTES=$(stat -c%s ${SNAPSHOT_DIR}/${SNAPSHOT_NAME})
+          SIZE_MB=$((SIZE_BYTES / 1024 / 1024))
+
+          # Update metadata
+          cat > ${SNAPSHOT_DIR}/latest.json << EOF
+          {
+            "chain_id": "${CHAIN_ID}",
+            "height": ${HEIGHT},
+            "timestamp": "${TIMESTAMP}",
+            "filename": "${SNAPSHOT_NAME}",
+            "size_bytes": ${SIZE_BYTES},
+            "size_mb": ${SIZE_MB},
+            "url": "https://artifacts.xaiblockchain.com/${CHAIN_ID}/snapshots/${SNAPSHOT_NAME}"
+          }
+          EOF
+
+          # Cleanup old snapshots (keep last N)
+          ls -t ${SNAPSHOT_DIR}/${CHAIN_ID}-*.tar.lz4 2>/dev/null | tail -n +$((RETENTION + 1)) | xargs -r rm -f 2>/dev/null || true
+
+          echo "[$(date)] XAI snapshot created: ${SNAPSHOT_NAME} (${SIZE_MB} MB)"
+
+          {% if upload_to_r2 %}
+          # Upload to R2 (requires rclone configured)
+          if command -v rclone &> /dev/null; then
+            echo "[$(date)] Uploading to R2..."
+            rclone copy ${SNAPSHOT_DIR}/${SNAPSHOT_NAME} r2:{{ artifacts_bucket }}/${CHAIN_ID}/snapshots/
+            rclone copy ${SNAPSHOT_DIR}/latest.json r2:{{ artifacts_bucket }}/${CHAIN_ID}/snapshots/
+            echo "[$(date)] Upload complete"
+          else
+            echo "[$(date)] WARNING: rclone not installed, skipping R2 upload"
+          fi
+          {% endif %}
+        dest: /usr/local/bin/xai-snapshot.sh
+        mode: '0755'
+        owner: root
+        group: root
+
+    - name: Create cron job for daily snapshots (midnight UTC)
+      ansible.builtin.cron:
+        name: "XAI daily snapshot"
+        minute: "0"
+        hour: "0"
+        job: "/usr/local/bin/xai-snapshot.sh >> /var/log/xai-snapshot.log 2>&1"
+        user: "{{ daemon_user }}"
+      when: enable_cron | bool
+
+    - name: Configure logrotate for snapshot logs
+      ansible.builtin.copy:
+        content: |
+          /var/log/xai-snapshot.log {
+              daily
+              rotate 7
+              compress
+              delaycompress
+              missingok
+              notifempty
+              create 0640 {{ daemon_user }} {{ daemon_user }}
+          }
+        dest: /etc/logrotate.d/xai-snapshot
+        mode: '0644'
+
+    - name: Display snapshot configuration
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          XAI Snapshot Configuration
+          ============================================
+          Node: {{ node_name }}
+          Snapshot Directory: {{ snapshot_dir }}
+          Retention: {{ snapshot_retention }} snapshots
+          Cron Enabled: {{ enable_cron }}
+          R2 Upload: {{ upload_to_r2 }}
+          ============================================
+
+          Manual snapshot:
+            sudo /usr/local/bin/xai-snapshot.sh
+
+          View logs:
+            tail -f /var/log/xai-snapshot.log
+          ============================================

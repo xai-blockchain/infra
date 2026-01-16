@@ -1,0 +1,61 @@
+---
+# Backup XAI node keys/wallets
+# Usage: ansible-playbook -i inventory/testnet.yml playbooks/backup-keys.yml
+
+- name: Backup XAI node keys
+  hosts: nodes
+  become: yes
+  gather_facts: yes
+  vars:
+    backup_dest: "/tmp/xai-keys-backup-{{ ansible_date_time.date }}"
+  tasks:
+    - name: Create local backup directory
+      ansible.builtin.file:
+        path: "{{ backup_dest }}"
+        state: directory
+        mode: '0700'
+      delegate_to: localhost
+      become: no
+      run_once: true
+
+    - name: Check for node identity file
+      ansible.builtin.stat:
+        path: "{{ data_dir }}/../node_identity.json"
+      register: identity_file
+
+    - name: Check for wallet files
+      ansible.builtin.find:
+        paths: "{{ data_dir }}/../wallets"
+        patterns: "*.json"
+      register: wallet_files
+
+    - name: Archive node keys
+      community.general.archive:
+        path:
+          - "{{ data_dir }}/../node_identity.json"
+          - "{{ data_dir }}/../wallets/"
+        dest: "/tmp/{{ node_name }}-keys.tar.gz"
+        format: gz
+      when: identity_file.stat.exists
+
+    - name: Fetch key backup
+      ansible.builtin.fetch:
+        src: "/tmp/{{ node_name }}-keys.tar.gz"
+        dest: "{{ backup_dest }}/{{ inventory_hostname }}-{{ node_name }}-keys.tar.gz"
+        flat: yes
+      when: identity_file.stat.exists
+
+    - name: Remove remote backup file
+      ansible.builtin.file:
+        path: "/tmp/{{ node_name }}-keys.tar.gz"
+        state: absent
+
+    - name: Display backup location
+      ansible.builtin.debug:
+        msg: |
+          Keys backed up to: {{ backup_dest }}/{{ inventory_hostname }}-{{ node_name }}-keys.tar.gz
+
+          IMPORTANT:
+          1. Move these files to secure storage immediately
+          2. Delete the /tmp backup after securing
+          3. Never commit keys to git

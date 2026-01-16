@@ -1,0 +1,33 @@
+---
+# Default variables for common role
+# All variables prefixed with common_ per ansible-lint convention
+
+common_timezone: UTC
+common_ssh_port: 22
+common_ssh_permit_root: "yes"
+common_ssh_password_auth: "no"
+
+common_ufw_enabled: true
+common_ufw_default_incoming: deny
+common_ufw_default_outgoing: allow
+
+common_packages:
+  - curl
+  - wget
+  - vim
+  - htop
+  - jq
+  - git
+  - make
+  - build-essential
+  - unzip
+  - tmux
+  - fail2ban
+  - ufw
+  - logrotate
+  - net-tools
+  - iotop
+  - sysstat
+
+common_snapshot_dir: /var/backups/blockchain
+common_backup_retention_days: 7

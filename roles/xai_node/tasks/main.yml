@@ -1,0 +1,109 @@
+---
+# XAI Node Role - Main Tasks
+
+- name: Verify required variables
+  ansible.builtin.assert:
+    that:
+      - node_name is defined
+      - rpc_port is defined
+      - p2p_port is defined
+      - daemon_home is defined
+      - daemon_user is defined
+    fail_msg: "Required XAI node variables not defined"
+
+- name: Create XAI directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ daemon_user }}"
+    group: "{{ daemon_user }}"
+    mode: '0755'
+  loop:
+    - "{{ daemon_home }}"
+    - "{{ daemon_home }}/data"
+    - "{{ daemon_home }}/logs"
+
+- name: Allow RPC port through UFW
+  community.general.ufw:
+    rule: allow
+    port: "{{ rpc_port }}"
+    proto: tcp
+  when: xai_node_ufw_enabled | default(true) and node_type in ['sentry']
+
+- name: Allow RPC port through UFW (VPN only for validators)
+  community.general.ufw:
+    rule: allow
+    port: "{{ rpc_port }}"
+    proto: tcp
+    from_ip: "{{ xai_node_vpn_network }}"
+  when: xai_node_ufw_enabled | default(true) and node_type in ['validator', 'node']
+
+- name: Allow P2P port through UFW
+  community.general.ufw:
+    rule: allow
+    port: "{{ p2p_port }}"
+    proto: tcp
+  when: xai_node_ufw_enabled | default(true)
+
+- name: Reload systemd daemon
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Deploy XAI node systemd service
+  ansible.builtin.template:
+    src: xai-node.service.j2
+    dest: "/etc/systemd/system/{{ service_name }}.service"
+    mode: '0644'
+  notify:
+    - Reload systemd
+    - Restart xai service
+
+- name: Reload systemd after service file change
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Enable and start XAI service
+  ansible.builtin.service:
+    name: "{{ service_name }}"
+    state: started
+    enabled: true
+
+- name: Wait for node to respond
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ rpc_port }}/stats"
+    return_content: true
+    timeout: 10
+  register: xai_node_status
+  until: xai_node_status.status == 200
+  retries: 30
+  delay: 2
+  failed_when: false
+
+- name: Display node status
+  ansible.builtin.debug:
+    msg: |
+      XAI Node {{ node_name }} Status:
+      {% if xai_node_status.status == 200 %}
+        Height: {{ (xai_node_status.content | from_json).chain_height | default('N/A') }}
+        Finalized: {{ (xai_node_status.content | from_json).finalized_height | default('N/A') }}
+        Peers: {{ (xai_node_status.content | from_json).peer_count | default('N/A') }}
+        Mining: {{ (xai_node_status.content | from_json).mining | default('N/A') }}
+      {% else %}
+        Node not responding yet (may still be starting)
+      {% endif %}
+  when: xai_node_status is defined
+
+- name: Configure logrotate for XAI logs
+  ansible.builtin.copy:
+    content: |
+      {{ daemon_home }}/logs/*.log {
+          daily
+          rotate 7
+          compress
+          delaycompress
+          missingok
+          notifempty
+          create 0640 {{ daemon_user }} {{ daemon_user }}
+      }
+    dest: /etc/logrotate.d/xai-{{ node_name }}
+    mode: '0644'

@@ -1,0 +1,315 @@
+---
+# XAI Key Backup Playbook
+#
+# Securely backs up node identity and wallet files with encryption.
+# Follows blockchain community standards for key management.
+#
+# Usage:
+#   # Backup to default location (/tmp/xai-keys-backup-{date}/)
+#   ansible-playbook -i inventory/testnet.yml support_backup_keys.yml --limit xai_node1
+#
+#   # Backup to custom location
+#   ansible-playbook -i inventory/testnet.yml support_backup_keys.yml --limit xai_node1 \
+#     -e backup_dest=/secure/backups
+#
+#   # Backup with custom encryption password (prompted if not set)
+#   ansible-playbook -i inventory/testnet.yml support_backup_keys.yml --limit xai_node1 \
+#     -e backup_password=YOUR_SECURE_PASSWORD
+#
+# Security Notes:
+#   - Backups are encrypted with AES-256 (GPG symmetric)
+#   - Store encryption password separately from backups
+#   - Transfer backups to geographically separate secure storage
+#   - Test restore procedure before relying on backups
+#
+# References:
+#   - https://docs.ethstaker.org/scaled-node-operators/key-management-at-scale
+#   - https://github.com/polkachu/cosmos-validators
+
+- name: XAI Key Backup
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    # Backup destination on Ansible controller
+    backup_dest: "/tmp/xai-keys-backup-{{ ansible_date_time.date }}"
+    # Whether to encrypt the backup (strongly recommended)
+    encrypt_backup: true
+    # Backup includes these components
+    backup_components:
+      - node_identity
+      - wallets
+      - config
+
+  handlers:
+    - name: Remove temporary files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ temp_files_to_clean | default([]) }}"
+      delegate_to: localhost
+      become: false
+
+  tasks:
+    # =========================================================================
+    # Pre-flight Checks
+    # =========================================================================
+    - name: Verify required variables
+      ansible.builtin.assert:
+        that:
+          - node_name is defined
+          - daemon_home is defined
+        fail_msg: "Required variables node_name and daemon_home must be defined"
+
+    - name: Check for GPG on controller (required for encryption)
+      ansible.builtin.command:
+        cmd: which gpg
+      delegate_to: localhost
+      become: false
+      register: gpg_check
+      changed_when: false
+      failed_when: false
+      when: encrypt_backup | bool
+
+    - name: Fail if GPG not available and encryption requested
+      ansible.builtin.fail:
+        msg: |
+          GPG is required for encrypted backups but not found on controller.
+          Install GPG or set encrypt_backup=false (not recommended).
+      when:
+        - encrypt_backup | bool
+        - gpg_check.rc != 0
+
+    - name: Prompt for backup password if not provided
+      ansible.builtin.pause:
+        prompt: "Enter encryption password for backup (min 12 characters)"
+        echo: false
+      register: password_prompt
+      delegate_to: localhost
+      become: false
+      when:
+        - encrypt_backup | bool
+        - backup_password is not defined
+      run_once: true  # noqa: run-once[task] - intentional for single password prompt
+
+    - name: Set backup password from prompt
+      ansible.builtin.set_fact:
+        backup_password: "{{ password_prompt.user_input }}"
+      when:
+        - encrypt_backup | bool
+        - backup_password is not defined
+        - password_prompt.user_input is defined
+      no_log: true
+
+    - name: Validate password strength
+      ansible.builtin.assert:
+        that:
+          - backup_password | length >= 12
+        fail_msg: "Backup password must be at least 12 characters"
+      when: encrypt_backup | bool
+      no_log: true
+
+    # =========================================================================
+    # Discover Key Files
+    # =========================================================================
+    - name: Check for node identity file
+      ansible.builtin.stat:
+        path: "{{ daemon_home }}/data/node_identity.json"
+      register: identity_file
+
+    - name: Check for wallet directory
+      ansible.builtin.stat:
+        path: "{{ daemon_home }}/wallets"
+      register: wallet_dir
+
+    - name: Check for config file
+      ansible.builtin.stat:
+        path: "{{ daemon_home }}/config.yml"
+      register: config_file
+
+    - name: Find wallet files
+      ansible.builtin.find:
+        paths: "{{ daemon_home }}/wallets"
+        patterns: "*.json"
+      register: wallet_files
+      when: wallet_dir.stat.exists
+
+    - name: Display discovered files
+      ansible.builtin.debug:
+        msg: |
+          Node: {{ node_name }}
+          Identity file: {{ 'FOUND' if identity_file.stat.exists else 'NOT FOUND' }}
+          Wallet directory: {{ 'FOUND (' ~ (wallet_files.files | default([]) | length) ~ ' files)' if wallet_dir.stat.exists else 'NOT FOUND' }}
+          Config file: {{ 'FOUND' if config_file.stat.exists else 'NOT FOUND' }}
+
+    - name: Fail if no identity file found
+      ansible.builtin.fail:
+        msg: |
+          No node_identity.json found at {{ daemon_home }}/data/node_identity.json
+          Cannot proceed with backup - nothing to back up.
+      when: not identity_file.stat.exists
+
+    # =========================================================================
+    # Create Backup Archive on Remote
+    # =========================================================================
+    - name: Create temporary backup directory on remote
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: xai_backup_
+      register: remote_temp_dir
+
+    - name: Copy node identity to temp directory
+      ansible.builtin.copy:
+        src: "{{ daemon_home }}/data/node_identity.json"
+        dest: "{{ remote_temp_dir.path }}/node_identity.json"
+        remote_src: true
+        mode: '0600'
+      when: identity_file.stat.exists
+
+    - name: Copy wallet files to temp directory
+      ansible.builtin.copy:
+        src: "{{ daemon_home }}/wallets/"
+        dest: "{{ remote_temp_dir.path }}/wallets/"
+        remote_src: true
+        mode: '0600'
+      when: wallet_dir.stat.exists and (wallet_files.files | default([]) | length) > 0
+
+    - name: Copy config file to temp directory
+      ansible.builtin.copy:
+        src: "{{ daemon_home }}/config.yml"
+        dest: "{{ remote_temp_dir.path }}/config.yml"
+        remote_src: true
+        mode: '0600'
+      when: config_file.stat.exists
+
+    - name: Create backup metadata file
+      ansible.builtin.copy:
+        content: |
+          {
+            "backup_date": "{{ ansible_date_time.iso8601 }}",
+            "node_name": "{{ node_name }}",
+            "hostname": "{{ inventory_hostname }}",
+            "daemon_home": "{{ daemon_home }}",
+            "chain_id": "{{ chain_id | default('xai-mvp-testnet-1') }}",
+            "backup_version": "1.0",
+            "components": {
+              "node_identity": {{ identity_file.stat.exists | lower }},
+              "wallets": {{ (wallet_dir.stat.exists and (wallet_files.files | default([]) | length) > 0) | lower }},
+              "config": {{ config_file.stat.exists | lower }}
+            },
+            "encrypted": {{ encrypt_backup | lower }}
+          }
+        dest: "{{ remote_temp_dir.path }}/backup_metadata.json"
+        mode: '0644'
+
+    - name: Create backup archive
+      community.general.archive:
+        path: "{{ remote_temp_dir.path }}/"
+        dest: "/tmp/{{ node_name }}-keys-{{ ansible_date_time.date }}.tar.gz"
+        format: gz
+        mode: '0600'
+      register: archive_result
+
+    # =========================================================================
+    # Fetch and Encrypt Backup
+    # =========================================================================
+    - name: Create local backup directory
+      ansible.builtin.file:
+        path: "{{ backup_dest }}"
+        state: directory
+        mode: '0700'
+      delegate_to: localhost
+      become: false
+
+    - name: Fetch backup archive to controller
+      ansible.builtin.fetch:
+        src: "/tmp/{{ node_name }}-keys-{{ ansible_date_time.date }}.tar.gz"
+        dest: "{{ backup_dest }}/{{ inventory_hostname }}-{{ node_name }}-keys.tar.gz"
+        flat: true
+
+    - name: Encrypt backup with GPG
+      ansible.builtin.command:
+        cmd: >
+          gpg --batch --yes --symmetric --cipher-algo AES256
+          --passphrase-fd 0
+          --output "{{ backup_dest }}/{{ inventory_hostname }}-{{ node_name }}-keys.tar.gz.gpg"
+          "{{ backup_dest }}/{{ inventory_hostname }}-{{ node_name }}-keys.tar.gz"
+        stdin: "{{ backup_password }}"
+      delegate_to: localhost
+      become: false
+      when: encrypt_backup | bool
+      no_log: true
+      register: encryption_result
+      changed_when: encryption_result.rc == 0
+
+    - name: Remove unencrypted backup after encryption
+      ansible.builtin.file:
+        path: "{{ backup_dest }}/{{ inventory_hostname }}-{{ node_name }}-keys.tar.gz"
+        state: absent
+      delegate_to: localhost
+      become: false
+      when:
+        - encrypt_backup | bool
+        - encryption_result is succeeded
+
+    - name: Generate backup checksum
+      ansible.builtin.stat:
+        path: "{{ backup_dest }}/{{ inventory_hostname }}-{{ node_name }}-keys.tar.gz{{ '.gpg' if encrypt_backup else '' }}"
+        checksum_algorithm: sha256
+      delegate_to: localhost
+      become: false
+      register: backup_checksum
+
+    - name: Save checksum file
+      ansible.builtin.copy:
+        content: |
+          {{ backup_checksum.stat.checksum }}  {{ inventory_hostname }}-{{ node_name }}-keys.tar.gz{{ '.gpg' if encrypt_backup else '' }}
+        dest: "{{ backup_dest }}/{{ inventory_hostname }}-{{ node_name }}-keys.sha256"
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+
+    # =========================================================================
+    # Cleanup
+    # =========================================================================
+    - name: Remove temporary backup directory on remote
+      ansible.builtin.file:
+        path: "{{ remote_temp_dir.path }}"
+        state: absent
+
+    - name: Remove temporary archive on remote
+      ansible.builtin.file:
+        path: "/tmp/{{ node_name }}-keys-{{ ansible_date_time.date }}.tar.gz"
+        state: absent
+
+    # =========================================================================
+    # Verification and Summary
+    # =========================================================================
+    - name: Verify backup file exists
+      ansible.builtin.stat:
+        path: "{{ backup_dest }}/{{ inventory_hostname }}-{{ node_name }}-keys.tar.gz{{ '.gpg' if encrypt_backup else '' }}"
+      delegate_to: localhost
+      become: false
+      register: final_backup
+
+    - name: Display backup summary
+      ansible.builtin.debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════════╗
+          ║                    XAI KEY BACKUP COMPLETE                       ║
+          ╠══════════════════════════════════════════════════════════════════╣
+          ║ Node: {{ node_name }}
+          ║ Host: {{ inventory_hostname }}
+          ║ Backup file: {{ backup_dest }}/{{ inventory_hostname }}-{{ node_name }}-keys.tar.gz{{ '.gpg' if encrypt_backup else '' }}
+          ║ Checksum: {{ backup_checksum.stat.checksum[:16] }}...
+          ║ Size: {{ final_backup.stat.size | human_readable }}
+          ║ Encrypted: {{ 'YES (AES-256)' if encrypt_backup else 'NO - NOT RECOMMENDED' }}
+          ╠══════════════════════════════════════════════════════════════════╣
+          ║ IMPORTANT - NEXT STEPS:                                          ║
+          ║ 1. Move backup to secure offline storage                         ║
+          ║ 2. Store encryption password SEPARATELY from backup              ║
+          ║ 3. Copy to geographically separate location                      ║
+          ║ 4. Test restore with support_restore_keys.yml                    ║
+          ║ 5. Delete {{ backup_dest }} after securing backup             ║
+          ╚══════════════════════════════════════════════════════════════════╝

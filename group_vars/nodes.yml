@@ -1,0 +1,16 @@
+---
+# XAI node-specific variables
+
+# Node type
+node_type: validator
+
+# Genesis and network
+genesis_url: https://artifacts.xaiblockchain.com/genesis.json
+
+# Public endpoints
+public_rpc: testnet-rpc.xaiblockchain.com
+public_api: testnet-api.xaiblockchain.com
+public_ws: testnet-ws.xaiblockchain.com
+
+# Service configuration
+service_name: "xai-{{ node_name }}"

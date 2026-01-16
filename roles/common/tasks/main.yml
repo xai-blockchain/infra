@@ -1,0 +1,113 @@
+---
+# Common server setup - hardening, packages, WireGuard
+
+- name: Include OS-specific variables
+  ansible.builtin.include_vars: "{{ ansible_os_family | lower }}.yml"
+  failed_when: false
+
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+  when: ansible_os_family == "Debian"
+
+- name: Install common packages
+  ansible.builtin.apt:
+    name: "{{ common_packages }}"
+    state: present
+  when: ansible_os_family == "Debian"
+
+- name: Set timezone
+  community.general.timezone:
+    name: "{{ common_timezone }}"
+
+- name: Configure SSH hardening
+  ansible.builtin.template:
+    src: sshd_config.j2
+    dest: /etc/ssh/sshd_config
+    owner: root
+    group: root
+    mode: '0644'
+    validate: '/usr/sbin/sshd -t -f %s'
+  notify: Restart sshd
+
+- name: Configure UFW defaults
+  community.general.ufw:
+    direction: "{{ item.direction }}"
+    policy: "{{ item.policy }}"
+  loop:
+    - { direction: incoming, policy: "{{ common_ufw_default_incoming }}" }
+    - { direction: outgoing, policy: "{{ common_ufw_default_outgoing }}" }
+  when: common_ufw_enabled
+
+- name: Allow SSH through UFW
+  community.general.ufw:
+    rule: allow
+    port: "{{ common_ssh_port }}"
+    proto: tcp
+  when: common_ufw_enabled
+
+- name: Allow WireGuard through UFW
+  community.general.ufw:
+    rule: allow
+    port: 51820
+    proto: udp
+  when: common_ufw_enabled
+
+- name: Enable UFW
+  community.general.ufw:
+    state: enabled
+  when: common_ufw_enabled
+
+- name: Configure fail2ban
+  ansible.builtin.template:
+    src: jail.local.j2
+    dest: /etc/fail2ban/jail.local
+    owner: root
+    group: root
+    mode: '0644'
+  notify: Restart fail2ban
+
+- name: Ensure fail2ban is running
+  ansible.builtin.service:
+    name: fail2ban
+    state: started
+    enabled: true
+
+- name: Configure sysctl for performance
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    sysctl_set: true
+    state: present
+    reload: true
+  loop:
+    - { key: 'net.core.somaxconn', value: '65535' }
+    - { key: 'net.ipv4.tcp_max_syn_backlog', value: '65535' }
+    - { key: 'net.core.netdev_max_backlog', value: '65535' }
+    - { key: 'vm.swappiness', value: '10' }
+    - { key: 'fs.file-max', value: '2097152' }
+
+- name: Set ulimits for blockchain services
+  ansible.builtin.template:
+    src: limits.conf.j2
+    dest: /etc/security/limits.d/99-blockchain.conf
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Create backup directory
+  ansible.builtin.file:
+    path: "{{ common_snapshot_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Configure logrotate for blockchain logs
+  ansible.builtin.template:
+    src: logrotate-blockchain.j2
+    dest: /etc/logrotate.d/blockchain
+    owner: root
+    group: root
+    mode: '0644'

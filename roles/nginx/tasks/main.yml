@@ -1,0 +1,128 @@
+---
+# Nginx reverse proxy deployment - Non-destructive version
+# Only manages Ansible-specific configs, preserves existing setup
+
+- name: Check if nginx is already installed and configured
+  ansible.builtin.stat:
+    path: /etc/nginx/conf.d
+  register: nginx_confd
+
+- name: Check for existing chain-specific upstream configs
+  ansible.builtin.command:
+    cmd: find /etc/nginx/conf.d -name '*.conf' -type f 2>/dev/null
+  register: nginx_existing_configs
+  changed_when: false
+  failed_when: false
+
+- name: Set nginx_already_configured fact
+  ansible.builtin.set_fact:
+    nginx_already_configured: "{{ nginx_existing_configs.stdout_lines | length > 0 }}"
+
+- name: Install Nginx (if not present)
+  ansible.builtin.apt:
+    name:
+      - nginx
+      - certbot
+      - python3-certbot-nginx
+    state: present
+  when: not nginx_already_configured or nginx_force_install | default(false)
+
+- name: Create SSL directory
+  ansible.builtin.file:
+    path: /etc/nginx/ssl
+    state: directory
+    owner: root
+    group: root
+    mode: '0700'
+
+# Only touch nginx.conf if explicitly requested
+- name: Configure Nginx main settings (only if requested)
+  ansible.builtin.template:
+    src: nginx.conf.j2
+    dest: /etc/nginx/nginx.conf
+    owner: root
+    group: root
+    mode: '0644'
+    backup: true
+  notify: Reload nginx
+  when: nginx_manage_main_config | default(false)
+
+# For servers with existing configs, just ensure our upstreams are present
+- name: Deploy Ansible-managed upstream config to conf.d
+  ansible.builtin.template:
+    src: "upstream-{{ chain }}.conf.j2"
+    dest: "/etc/nginx/conf.d/ansible-{{ chain }}-upstream.conf"
+    owner: root
+    group: root
+    mode: '0644'
+    backup: true
+  notify: Reload nginx
+  when:
+    - chain is defined
+    - nginx_manage_upstreams | default(true)
+    - nginx_already_configured
+
+# Only create site configs on fresh installs or when explicitly requested
+- name: Remove default site (fresh install only)
+  ansible.builtin.file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  notify: Reload nginx
+  when: not nginx_already_configured or nginx_force_install | default(false)
+
+- name: Deploy chain-specific virtual hosts (fresh install only)
+  ansible.builtin.template:
+    src: "vhost-{{ chain }}.conf.j2"
+    dest: "/etc/nginx/sites-available/{{ chain }}.conf"
+    owner: root
+    group: root
+    mode: '0644'
+    backup: true
+  notify: Reload nginx
+  when:
+    - chain is defined
+    - not nginx_already_configured or nginx_force_install | default(false)
+
+- name: Enable chain virtual host (fresh install only)
+  ansible.builtin.file:
+    src: "/etc/nginx/sites-available/{{ chain }}.conf"
+    dest: "/etc/nginx/sites-enabled/{{ chain }}.conf"
+    state: link
+  notify: Reload nginx
+  when:
+    - chain is defined
+    - not nginx_already_configured or nginx_force_install | default(false)
+
+- name: Allow HTTP through UFW
+  community.general.ufw:
+    rule: allow
+    port: 80
+    proto: tcp
+  failed_when: false
+
+- name: Allow HTTPS through UFW
+  community.general.ufw:
+    rule: allow
+    port: 443
+    proto: tcp
+  failed_when: false
+
+- name: Ensure Nginx is running
+  ansible.builtin.service:
+    name: nginx
+    state: started
+    enabled: true
+
+- name: Set up SSL certificate renewal cron
+  ansible.builtin.cron:
+    name: "Renew SSL certificates"
+    job: "certbot renew --quiet --post-hook 'systemctl reload nginx'"
+    hour: "3"
+    minute: "30"
+    day: "1,15"
+
+- name: Display nginx configuration status
+  ansible.builtin.debug:
+    msg: >
+      Nginx status: {{ 'Already configured (preserving existing setup)' if nginx_already_configured else 'Fresh install' }}.
+      To force full reconfiguration, set nginx_force_install=true.

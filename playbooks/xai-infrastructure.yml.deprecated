@@ -1,0 +1,1029 @@
+---
+# =============================================================================
+# XAI BLOCKCHAIN - PRODUCTION ANSIBLE PLAYBOOK
+# =============================================================================
+# Chain: XAI (Python-based AI compute blockchain)
+# Chain ID: xai-mvp-testnet-1
+# Language: Python 3.12
+# Process Manager: systemd with virtualenv
+#
+# Key Differences from Cosmos SDK:
+# - Python virtualenv instead of cosmovisor
+# - /stats endpoint instead of /status
+# - chain_height instead of latest_block_height
+# - Custom finality metrics (finalized_height)
+# - No cosmos-exporter (custom metrics)
+#
+# Usage:
+#   Full deployment:  ansible-playbook -i inventory/testnet.yml xai-playbook.yml
+#   Specific role:    ansible-playbook -i inventory/testnet.yml xai-playbook.yml --tags monitoring
+#   Single host:      ansible-playbook -i inventory/testnet.yml xai-playbook.yml --limit node1
+# =============================================================================
+
+- name: XAI Infrastructure Deployment
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    # Chain configuration
+    chain_name: "XAI"
+    chain_id: "xai-mvp-testnet-1"
+    daemon_name: "xai"
+
+    # Python configuration
+    python_version: "3.12"
+    pip_packages:
+      - pip
+      - wheel
+      - setuptools
+      - prometheus-client  # For custom metrics
+
+    # Versioning
+    node_exporter_version: "1.7.0"
+    prometheus_version: "2.48.0"
+    alertmanager_version: "0.26.0"
+    loki_version: "2.9.3"
+
+    # Directories
+    daemon_home: "/home/{{ daemon_user }}/xai-mvp/{{ node_name }}"
+    venv_path: "/home/{{ daemon_user }}/xai/venv"
+    xai_src: "/home/{{ daemon_user }}/xai"
+    backup_dir: "/home/{{ daemon_user }}/xai-backups"
+    snapshot_dir: "/home/{{ daemon_user }}/xai-snapshots"
+    log_dir: "/var/log/xai"
+
+    # Network
+    peers_url: "https://artifacts.xaiblockchain.com/xai-mvp-testnet-1/peers.txt"
+
+    # Monitoring
+    node_exporter_port: 9100
+    prometheus_port: 9090
+    alertmanager_port: 9093
+    xai_metrics_port: 9302  # Custom XAI metrics
+    grafana_port: 3000
+
+    # Security
+    ufw_enabled: true
+    ssh_port: 22
+    vpn_network: "10.10.0.0/24"
+
+    # XAI-specific environment
+    xai_env:
+      XAI_CHAIN_ID: "{{ chain_id }}"
+      XAI_FAST_MINING: "1"
+      XAI_ALLOW_EMPTY_MINING: "true"
+      XAI_FINALITY_ENABLED: "true"
+
+    # Alerting (from SOPS)
+    discord_webhook: "{{ vault_discord_webhook | default('') }}"
+    telegram_bot_token: "{{ vault_telegram_bot_token | default('') }}"
+    telegram_chat_id: "{{ vault_telegram_chat_id | default('') }}"
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Restart sshd
+      ansible.builtin.service:
+        name: sshd
+        state: restarted
+
+    - name: Restart fail2ban
+      ansible.builtin.service:
+        name: fail2ban
+        state: restarted
+
+    - name: Restart XAI service
+      ansible.builtin.service:
+        name: "{{ service_name }}"
+        state: restarted
+
+    - name: Restart node_exporter
+      ansible.builtin.service:
+        name: node_exporter
+        state: restarted
+
+    - name: Restart prometheus
+      ansible.builtin.service:
+        name: prometheus
+        state: restarted
+
+    - name: Restart alertmanager
+      ansible.builtin.service:
+        name: alertmanager
+        state: restarted
+
+    - name: Restart xai_metrics
+      ansible.builtin.service:
+        name: xai-metrics
+        state: restarted
+
+    - name: Restart xai_monitor
+      ansible.builtin.service:
+        name: xai-monitor
+        state: restarted
+
+    - name: Restart promtail
+      ansible.builtin.service:
+        name: promtail
+        state: restarted
+
+    - name: Restart wireguard
+      ansible.builtin.service:
+        name: wg-quick@wg0
+        state: restarted
+
+  # ===========================================================================
+  # ROLE: COMMON - Base server security and packages
+  # ===========================================================================
+  tasks:
+    - name: "[COMMON] Update apt cache"
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+      tags: [common, security]
+
+    - name: "[COMMON] Install base packages"
+      ansible.builtin.apt:
+        name:
+          - curl
+          - wget
+          - git
+          - jq
+          - htop
+          - tmux
+          - vim
+          - unzip
+          - lz4
+          - build-essential
+          - ufw
+          - fail2ban
+          - logrotate
+          - ca-certificates
+          - gnupg
+          - apt-transport-https
+          # Python-specific
+          - python3
+          - python3-pip
+          - python3-venv
+          - python3-dev
+          - libffi-dev
+          - libssl-dev
+        state: present
+      tags: [common]
+
+    - name: "[COMMON] Set timezone to UTC"
+      community.general.timezone:
+        name: UTC
+      tags: [common]
+
+    - name: "[COMMON] Configure SSH hardening"
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+        validate: '/usr/sbin/sshd -t -f %s'
+      loop:
+        - { regexp: '^#?PermitRootLogin', line: 'PermitRootLogin no' }
+        - { regexp: '^#?PasswordAuthentication', line: 'PasswordAuthentication no' }
+        - { regexp: '^#?PubkeyAuthentication', line: 'PubkeyAuthentication yes' }
+        - { regexp: '^#?PermitEmptyPasswords', line: 'PermitEmptyPasswords no' }
+        - { regexp: '^#?X11Forwarding', line: 'X11Forwarding no' }
+        - { regexp: '^#?MaxAuthTries', line: 'MaxAuthTries 3' }
+        - { regexp: '^#?ClientAliveInterval', line: 'ClientAliveInterval 300' }
+        - { regexp: '^#?ClientAliveCountMax', line: 'ClientAliveCountMax 2' }
+      notify: Restart sshd
+      tags: [common, security]
+
+    - name: "[COMMON] Configure UFW defaults"
+      community.general.ufw:
+        direction: "{{ item.direction }}"
+        policy: "{{ item.policy }}"
+      loop:
+        - { direction: incoming, policy: deny }
+        - { direction: outgoing, policy: allow }
+      when: ufw_enabled
+      tags: [common, firewall]
+
+    - name: "[COMMON] Allow SSH through UFW"
+      community.general.ufw:
+        rule: allow
+        port: "{{ ssh_port }}"
+        proto: tcp
+      when: ufw_enabled
+      tags: [common, firewall]
+
+    - name: "[COMMON] Enable UFW"
+      community.general.ufw:
+        state: enabled
+      when: ufw_enabled
+      tags: [common, firewall]
+
+    - name: "[COMMON] Configure fail2ban for SSH"
+      ansible.builtin.copy:
+        content: |
+          [sshd]
+          enabled = true
+          port = {{ ssh_port }}
+          filter = sshd
+          logpath = /var/log/auth.log
+          maxretry = 3
+          bantime = 3600
+          findtime = 600
+        dest: /etc/fail2ban/jail.local
+        mode: '0644'
+      notify: Restart fail2ban
+      tags: [common, security]
+
+    - name: "[COMMON] Configure sysctl for blockchain performance"
+      ansible.posix.sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        sysctl_set: true
+        state: present
+        reload: true
+      loop:
+        - { key: 'net.core.somaxconn', value: '65535' }
+        - { key: 'net.ipv4.tcp_max_syn_backlog', value: '65535' }
+        - { key: 'net.core.netdev_max_backlog', value: '65535' }
+        - { key: 'net.ipv4.tcp_tw_reuse', value: '1' }
+        - { key: 'net.ipv4.ip_local_port_range', value: '1024 65535' }
+        - { key: 'vm.swappiness', value: '10' }
+        - { key: 'fs.file-max', value: '2097152' }
+        - { key: 'fs.inotify.max_user_watches', value: '524288' }
+      tags: [common, performance]
+
+    - name: "[COMMON] Configure ulimits for blockchain"
+      ansible.builtin.copy:
+        content: |
+          # XAI blockchain ulimits
+          *               soft    nofile          65535
+          *               hard    nofile          65535
+          *               soft    nproc           65535
+          *               hard    nproc           65535
+          {{ daemon_user }}    soft    nofile          65535
+          {{ daemon_user }}    hard    nofile          65535
+        dest: /etc/security/limits.d/99-xai.conf
+        mode: '0644'
+      tags: [common, performance]
+
+  # ===========================================================================
+  # ROLE: WIREGUARD - Private validator network
+  # ===========================================================================
+    - name: "[WIREGUARD] Install WireGuard"
+      ansible.builtin.apt:
+        name: wireguard
+        state: present
+      tags: [wireguard, network]
+
+    - name: "[WIREGUARD] Allow WireGuard through UFW"
+      community.general.ufw:
+        rule: allow
+        port: 51820
+        proto: udp
+      when: ufw_enabled
+      tags: [wireguard, firewall]
+
+  # ===========================================================================
+  # ROLE: XAI NODE - Python blockchain node deployment
+  # ===========================================================================
+    - name: "[XAI_NODE] Create XAI directories"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ daemon_user }}"
+        group: "{{ daemon_user }}"
+        mode: '0755'
+      loop:
+        - "{{ daemon_home }}"
+        - "{{ daemon_home }}/data"
+        - "{{ daemon_home }}/logs"
+        - "{{ xai_src }}"
+      tags: [xai_node, deploy]
+
+    - name: "[XAI_NODE] Create Python virtual environment"
+      ansible.builtin.command:
+        cmd: "python3 -m venv {{ venv_path }}"
+        creates: "{{ venv_path }}/bin/python"
+      become: true
+      become_user: "{{ daemon_user }}"
+      tags: [xai_node, deploy]
+
+    - name: "[XAI_NODE] Install pip dependencies in virtual environment"
+      ansible.builtin.pip:
+        name:
+          - pip
+          - wheel
+          - setuptools
+          - prometheus-client
+          - requests
+        state: present
+        virtualenv: "{{ venv_path }}"
+      become: true
+      become_user: "{{ daemon_user }}"
+      tags: [xai_node, deploy]
+
+    - name: "[XAI_NODE] Create node configuration"
+      ansible.builtin.template:
+        src: templates/xai-config.yml.j2
+        dest: "{{ daemon_home }}/config.yml"
+        owner: "{{ daemon_user }}"
+        group: "{{ daemon_user }}"
+        mode: '0644'
+      notify: Restart XAI service
+      tags: [xai_node, config]
+
+    - name: "[XAI_NODE] Create systemd service"
+      ansible.builtin.template:
+        src: templates/xai-node.service.j2
+        dest: "/etc/systemd/system/{{ service_name }}.service"
+        owner: root
+        group: root
+        mode: '0644'
+      notify:
+        - Reload systemd
+        - Restart XAI service
+      tags: [xai_node, service]
+
+    - name: "[XAI_NODE] Allow P2P port through UFW"
+      community.general.ufw:
+        rule: allow
+        port: "{{ p2p_port }}"
+        proto: tcp
+      when: ufw_enabled
+      tags: [xai_node, firewall]
+
+    - name: "[XAI_NODE] Allow RPC port through UFW (validators: VPN only)"
+      community.general.ufw:
+        rule: allow
+        port: "{{ rpc_port }}"
+        proto: tcp
+        from_ip: "{{ vpn_network if node_type == 'validator' else 'any' }}"
+      when: ufw_enabled
+      tags: [xai_node, firewall]
+
+    - name: "[XAI_NODE] Reload systemd daemon"
+      ansible.builtin.systemd:
+        daemon_reload: true
+      tags: [xai_node, service]
+
+    - name: "[XAI_NODE] Enable and start service"
+      ansible.builtin.service:
+        name: "{{ service_name }}"
+        state: started
+        enabled: true
+      tags: [xai_node, service]
+
+  # ===========================================================================
+  # ROLE: NODE EXPORTER - System metrics
+  # ===========================================================================
+    - name: "[NODE_EXPORTER] Create prometheus user"
+      ansible.builtin.user:
+        name: prometheus
+        shell: /usr/sbin/nologin
+        create_home: false
+        system: true
+      tags: [monitoring, node_exporter]
+
+    - name: "[NODE_EXPORTER] Download node_exporter"
+      ansible.builtin.get_url:
+        url: "https://github.com/prometheus/node_exporter/releases/download/\
+              v{{ node_exporter_version }}/\
+              node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
+        dest: /tmp/node_exporter.tar.gz
+        mode: '0644'
+      tags: [monitoring, node_exporter]
+
+    - name: "[NODE_EXPORTER] Extract node_exporter"
+      ansible.builtin.unarchive:
+        src: /tmp/node_exporter.tar.gz
+        dest: /opt/
+        remote_src: true
+        creates: "/opt/node_exporter-{{ node_exporter_version }}.linux-amd64"
+      tags: [monitoring, node_exporter]
+
+    - name: "[NODE_EXPORTER] Remove old binary if exists"
+      ansible.builtin.file:
+        path: /usr/local/bin/node_exporter
+        state: absent
+      when: ansible_facts['file'] is not defined
+      tags: [monitoring, node_exporter]
+
+    - name: "[NODE_EXPORTER] Create symlink"
+      ansible.builtin.file:
+        src: "/opt/node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter"
+        dest: /usr/local/bin/node_exporter
+        state: link
+        force: true
+      tags: [monitoring, node_exporter]
+
+    - name: "[NODE_EXPORTER] Create systemd service"
+      ansible.builtin.copy:
+        content: |
+          [Unit]
+          Description=Node Exporter
+          After=network.target
+
+          [Service]
+          User=prometheus
+          ExecStart=/usr/local/bin/node_exporter \
+            --web.listen-address=:{{ node_exporter_port }} \
+            --collector.systemd \
+            --collector.processes
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/node_exporter.service
+        mode: '0644'
+      notify:
+        - Reload systemd
+        - Restart node_exporter
+      tags: [monitoring, node_exporter]
+
+    - name: "[NODE_EXPORTER] Allow port through UFW (VPN only)"
+      community.general.ufw:
+        rule: allow
+        port: "{{ node_exporter_port }}"
+        proto: tcp
+        from_ip: "{{ vpn_network }}"
+      when: ufw_enabled
+      tags: [monitoring, node_exporter, firewall]
+
+    - name: "[NODE_EXPORTER] Enable and start service"
+      ansible.builtin.service:
+        name: node_exporter
+        state: started
+        enabled: true
+      tags: [monitoring, node_exporter]
+
+  # ===========================================================================
+  # ROLE: XAI METRICS EXPORTER - Custom chain metrics
+  # ===========================================================================
+  # XAI doesn't use cosmos-exporter; we create a custom Python metrics exporter
+
+    - name: "[XAI_METRICS] Create metrics exporter script"
+      ansible.builtin.copy:
+        content: |
+          #!/usr/bin/env python3
+          """
+          XAI Prometheus Metrics Exporter
+          Exposes XAI-specific metrics for Prometheus scraping
+          """
+          import time
+          import requests
+          from prometheus_client import start_http_server, Gauge, Counter, Info
+          import logging
+
+          logging.basicConfig(level=logging.INFO)
+          logger = logging.getLogger(__name__)
+
+          # Metrics
+          xai_chain_height = Gauge('xai_chain_height', 'Current chain height', ['node'])
+          xai_finalized_height = Gauge('xai_finalized_height', 'Finalized block height', ['node'])
+          xai_peer_count = Gauge('xai_peer_count', 'Number of connected peers', ['node'])
+          xai_mining_active = Gauge('xai_mining_active', 'Whether node is mining', ['node'])
+          xai_mempool_size = Gauge('xai_mempool_size', 'Transactions in mempool', ['node'])
+          xai_finality_lag = Gauge('xai_finality_lag', 'Blocks behind finality', ['node'])
+          xai_node_info = Info('xai_node', 'XAI node information')
+
+          # Configuration
+          XAI_RPC_PORT = {{ rpc_port }}
+          NODE_NAME = "{{ node_name }}"
+          SCRAPE_INTERVAL = 15  # seconds
+
+          def collect_metrics():
+              """Collect metrics from XAI node"""
+              try:
+                  response = requests.get(f'http://127.0.0.1:{XAI_RPC_PORT}/stats', timeout=10)
+                  if response.status_code == 200:
+                      stats = response.json()
+
+                      height = stats.get('chain_height', 0)
+                      finalized = stats.get('finalized_height', 0)
+
+                      xai_chain_height.labels(node=NODE_NAME).set(height)
+                      xai_finalized_height.labels(node=NODE_NAME).set(finalized)
+                      xai_peer_count.labels(node=NODE_NAME).set(stats.get('peer_count', 0))
+                      xai_mining_active.labels(node=NODE_NAME).set(1 if stats.get('mining', False) else 0)
+                      xai_mempool_size.labels(node=NODE_NAME).set(stats.get('mempool_size', 0))
+                      xai_finality_lag.labels(node=NODE_NAME).set(height - finalized)
+
+                      xai_node_info.info({
+                          'chain_id': stats.get('chain_id', 'unknown'),
+                          'version': stats.get('version', 'unknown'),
+                          'node_name': NODE_NAME
+                      })
+
+                      logger.debug(f"Collected metrics: height={height}, finalized={finalized}")
+                  else:
+                      logger.warning(f"Failed to get stats: HTTP {response.status_code}")
+              except Exception as e:
+                  logger.error(f"Error collecting metrics: {e}")
+
+          if __name__ == '__main__':
+              # Start Prometheus metrics server
+              start_http_server({{ xai_metrics_port }})
+              logger.info(f"XAI metrics exporter started on port {{ xai_metrics_port }}")
+
+              while True:
+                  collect_metrics()
+                  time.sleep(SCRAPE_INTERVAL)
+        dest: /usr/local/bin/xai-metrics-exporter.py
+        mode: '0755'
+      when: node_type == 'validator' or node_type == 'node'
+      tags: [monitoring, xai_metrics]
+
+    - name: "[XAI_METRICS] Create systemd service"
+      ansible.builtin.copy:
+        content: |
+          [Unit]
+          Description=XAI Prometheus Metrics Exporter
+          After=network.target xai-{{ node_name }}.service
+
+          [Service]
+          User=prometheus
+          Environment=PATH={{ venv_path }}/bin:/usr/bin
+          ExecStart={{ venv_path }}/bin/python /usr/local/bin/xai-metrics-exporter.py
+          Restart=on-failure
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/xai-metrics.service
+        mode: '0644'
+      when: node_type == 'validator' or node_type == 'node'
+      notify:
+        - Reload systemd
+        - Restart xai_metrics
+      tags: [monitoring, xai_metrics]
+
+    - name: "[XAI_METRICS] Allow port through UFW (VPN only)"
+      community.general.ufw:
+        rule: allow
+        port: "{{ xai_metrics_port }}"
+        proto: tcp
+        from_ip: "{{ vpn_network }}"
+      when: ufw_enabled and (node_type == 'validator' or node_type == 'node')
+      tags: [monitoring, xai_metrics, firewall]
+
+    - name: "[XAI_METRICS] Enable and start service"
+      ansible.builtin.service:
+        name: xai-metrics
+        state: started
+        enabled: true
+      when: node_type == 'validator' or node_type == 'node'
+      tags: [monitoring, xai_metrics]
+
+  # ===========================================================================
+  # ROLE: XAI MONITOR - Uptime monitoring with alerts (like Tenderduty)
+  # ===========================================================================
+  # Custom Python monitor since Tenderduty is Cosmos-specific
+
+    - name: "[XAI_MONITOR] Create monitor script"
+      ansible.builtin.copy:
+        content: |
+          #!/usr/bin/env python3
+          """
+          XAI Node Monitor
+          Monitors node health and sends alerts via Discord/Telegram
+          Similar to Tenderduty but for XAI Python blockchain
+          """
+          import time
+          import requests
+          import logging
+          from datetime import datetime, timedelta
+
+          logging.basicConfig(
+              level=logging.INFO,
+              format='%(asctime)s - %(levelname)s - %(message)s'
+          )
+          logger = logging.getLogger(__name__)
+
+          # Configuration
+          NODE_NAME = "{{ node_name }}"
+          RPC_URL = "http://127.0.0.1:{{ rpc_port }}"
+          CHAIN_ID = "{{ chain_id }}"
+
+          # Alert thresholds
+          STALL_MINUTES = 10
+          FINALITY_LAG_THRESHOLD = 100
+          MIN_PEERS = 2
+
+          # Webhooks (from SOPS secrets)
+          DISCORD_WEBHOOK = "{{ discord_webhook }}"
+          TELEGRAM_BOT_TOKEN = "{{ telegram_bot_token }}"
+          TELEGRAM_CHAT_ID = "{{ telegram_chat_id }}"
+
+          # State tracking
+          last_height = 0
+          last_height_time = datetime.now()
+          alert_sent = {}
+
+          def send_discord_alert(title, message, color=16711680):
+              """Send alert to Discord"""
+              if not DISCORD_WEBHOOK:
+                  return
+              try:
+                  payload = {
+                      "embeds": [{
+                          "title": f"🚨 {title}",
+                          "description": message,
+                          "color": color,
+                          "footer": {"text": f"XAI Monitor - {NODE_NAME}"},
+                          "timestamp": datetime.utcnow().isoformat()
+                      }]
+                  }
+                  requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
+                  logger.info(f"Discord alert sent: {title}")
+              except Exception as e:
+                  logger.error(f"Failed to send Discord alert: {e}")
+
+          def send_telegram_alert(message):
+              """Send alert to Telegram"""
+              if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+                  return
+              try:
+                  url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+                  payload = {
+                      "chat_id": TELEGRAM_CHAT_ID,
+                      "text": f"🚨 XAI Alert [{NODE_NAME}]\n\n{message}",
+                      "parse_mode": "HTML"
+                  }
+                  requests.post(url, json=payload, timeout=10)
+                  logger.info("Telegram alert sent")
+              except Exception as e:
+                  logger.error(f"Failed to send Telegram alert: {e}")
+
+          def check_node():
+              """Check node health and send alerts"""
+              global last_height, last_height_time, alert_sent
+
+              try:
+                  response = requests.get(f"{RPC_URL}/stats", timeout=10)
+                  if response.status_code != 200:
+                      if not alert_sent.get('node_down'):
+                          send_discord_alert(
+                              "Node Down",
+                              f"Node {NODE_NAME} is not responding (HTTP {response.status_code})"
+                          )
+                          send_telegram_alert(f"Node {NODE_NAME} is not responding!")
+                          alert_sent['node_down'] = True
+                      return
+
+                  # Node is up - clear down alert
+                  if alert_sent.get('node_down'):
+                      send_discord_alert("Node Recovered", f"Node {NODE_NAME} is back online", color=65280)
+                      alert_sent['node_down'] = False
+
+                  stats = response.json()
+                  height = stats.get('chain_height', 0)
+                  finalized = stats.get('finalized_height', 0)
+                  peers = stats.get('peer_count', 0)
+                  mining = stats.get('mining', False)
+
+                  # Check for stalled chain
+                  if height == last_height:
+                      stall_duration = datetime.now() - last_height_time
+                      if stall_duration > timedelta(minutes=STALL_MINUTES):
+                          if not alert_sent.get('stalled'):
+                              send_discord_alert(
+                                  "Chain Stalled",
+                                  f"No new blocks in {STALL_MINUTES} minutes!\nLast height: {height}"
+                              )
+                              send_telegram_alert(f"Chain stalled at height {height}!")
+                              alert_sent['stalled'] = True
+                  else:
+                      last_height = height
+                      last_height_time = datetime.now()
+                      if alert_sent.get('stalled'):
+                          send_discord_alert("Chain Resumed", f"Chain is producing blocks again at height {height}", color=65280)
+                          alert_sent['stalled'] = False
+
+                  # Check finality lag
+                  finality_lag = height - finalized
+                  if finality_lag > FINALITY_LAG_THRESHOLD:
+                      if not alert_sent.get('finality_lag'):
+                          send_discord_alert(
+                              "Finality Lag Warning",
+                              f"Finality lagging by {finality_lag} blocks\nHeight: {height}, Finalized: {finalized}"
+                          )
+                          alert_sent['finality_lag'] = True
+                  elif alert_sent.get('finality_lag') and finality_lag < FINALITY_LAG_THRESHOLD // 2:
+                      send_discord_alert("Finality Recovered", f"Finality lag reduced to {finality_lag} blocks", color=65280)
+                      alert_sent['finality_lag'] = False
+
+                  # Check peer count
+                  if peers < MIN_PEERS:
+                      if not alert_sent.get('low_peers'):
+                          send_discord_alert(
+                              "Low Peer Count",
+                              f"Only {peers} peers connected (minimum: {MIN_PEERS})"
+                          )
+                          alert_sent['low_peers'] = True
+                  elif alert_sent.get('low_peers') and peers >= MIN_PEERS:
+                      send_discord_alert("Peers Recovered", f"Now connected to {peers} peers", color=65280)
+                      alert_sent['low_peers'] = False
+
+                  logger.info(f"Health check: height={height}, finalized={finalized}, peers={peers}, mining={mining}")
+
+              except requests.exceptions.ConnectionError:
+                  if not alert_sent.get('node_down'):
+                      send_discord_alert("Node Unreachable", f"Cannot connect to {NODE_NAME}")
+                      send_telegram_alert(f"Cannot connect to node {NODE_NAME}!")
+                      alert_sent['node_down'] = True
+              except Exception as e:
+                  logger.error(f"Health check failed: {e}")
+
+          if __name__ == '__main__':
+              logger.info(f"Starting XAI monitor for {NODE_NAME}")
+              logger.info(f"RPC: {RPC_URL}")
+              logger.info(f"Discord alerts: {'enabled' if DISCORD_WEBHOOK else 'disabled'}")
+              logger.info(f"Telegram alerts: {'enabled' if TELEGRAM_BOT_TOKEN else 'disabled'}")
+
+              while True:
+                  check_node()
+                  time.sleep(30)  # Check every 30 seconds
+        dest: /usr/local/bin/xai-monitor.py
+        mode: '0755'
+      when: node_type == 'validator' or node_type == 'node'
+      tags: [monitoring, xai_monitor]
+
+    - name: "[XAI_MONITOR] Create systemd service"
+      ansible.builtin.copy:
+        content: |
+          [Unit]
+          Description=XAI Node Monitor (alerts)
+          After=network.target xai-{{ node_name }}.service
+
+          [Service]
+          User={{ daemon_user }}
+          Environment=PATH={{ venv_path }}/bin:/usr/bin
+          ExecStart={{ venv_path }}/bin/python /usr/local/bin/xai-monitor.py
+          Restart=on-failure
+          RestartSec=30
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/xai-monitor.service
+        mode: '0644'
+      when: node_type == 'validator' or node_type == 'node'
+      notify:
+        - Reload systemd
+        - Restart xai_monitor
+      tags: [monitoring, xai_monitor]
+
+    - name: "[XAI_MONITOR] Enable and start service"
+      ansible.builtin.service:
+        name: xai-monitor
+        state: started
+        enabled: true
+      when: node_type == 'validator' or node_type == 'node'
+      tags: [monitoring, xai_monitor]
+
+  # ===========================================================================
+  # ROLE: SNAPSHOT - Automated snapshot creation
+  # ===========================================================================
+    - name: "[SNAPSHOT] Create snapshot directory"
+      ansible.builtin.file:
+        path: "{{ snapshot_dir }}"
+        state: directory
+        owner: "{{ daemon_user }}"
+        mode: '0755'
+      when: enable_snapshots | default(false)
+      tags: [snapshot]
+
+    - name: "[SNAPSHOT] Deploy XAI snapshot script"
+      ansible.builtin.copy:
+        content: |
+          #!/bin/bash
+          set -euo pipefail
+
+          CHAIN_ID="{{ chain_id }}"
+          DAEMON_HOME="{{ daemon_home }}"
+          SNAPSHOT_DIR="{{ snapshot_dir }}"
+          SERVICE_NAME="xai-{{ node_name }}"
+          RPC_PORT="{{ rpc_port }}"
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+          # Get current height from XAI /stats endpoint
+          HEIGHT=$(curl -s http://127.0.0.1:${RPC_PORT}/stats | jq -r '.chain_height')
+          SNAPSHOT_NAME="${CHAIN_ID}-${HEIGHT}-${TIMESTAMP}.tar.lz4"
+
+          echo "[$(date)] Creating XAI snapshot at height ${HEIGHT}..."
+
+          # Stop the service
+          sudo systemctl stop ${SERVICE_NAME}
+          sleep 5
+
+          # Create snapshot of data directory
+          cd ${DAEMON_HOME}
+          tar -cvf - data | lz4 -9 > ${SNAPSHOT_DIR}/${SNAPSHOT_NAME}
+
+          # Restart the service
+          sudo systemctl start ${SERVICE_NAME}
+
+          # Create latest symlink
+          ln -sf ${SNAPSHOT_DIR}/${SNAPSHOT_NAME} ${SNAPSHOT_DIR}/latest.tar.lz4
+
+          # Update metadata
+          cat > ${SNAPSHOT_DIR}/latest.json << EOF
+          {
+            "chain_id": "${CHAIN_ID}",
+            "height": ${HEIGHT},
+            "timestamp": "${TIMESTAMP}",
+            "filename": "${SNAPSHOT_NAME}",
+            "size_bytes": $(stat -c%s ${SNAPSHOT_DIR}/${SNAPSHOT_NAME})
+          }
+          EOF
+
+          # Cleanup old snapshots (keep last 3)
+          ls -t ${SNAPSHOT_DIR}/${CHAIN_ID}-*.tar.lz4 2>/dev/null | tail -n +4 | xargs rm -f 2>/dev/null || true
+
+          echo "[$(date)] XAI snapshot created: ${SNAPSHOT_NAME}"
+        dest: /usr/local/bin/xai-snapshot.sh
+        mode: '0755'
+      when: enable_snapshots | default(false)
+      tags: [snapshot]
+
+    - name: "[SNAPSHOT] Create cron job (daily at midnight UTC)"
+      ansible.builtin.cron:
+        name: "XAI daily snapshot"
+        minute: "0"
+        hour: "0"
+        job: "/usr/local/bin/xai-snapshot.sh >> /var/log/xai-snapshot.log 2>&1"
+        user: "{{ daemon_user }}"
+      when: enable_snapshots | default(false)
+      tags: [snapshot]
+
+  # ===========================================================================
+  # ROLE: ALERTMANAGER - Alert routing
+  # ===========================================================================
+    - name: "[ALERTMANAGER] Download alertmanager"
+      ansible.builtin.get_url:
+        url: >-
+          https://github.com/prometheus/alertmanager/releases/download/v{{ alertmanager_version }}/alertmanager-{{ alertmanager_version }}.linux-amd64.tar.gz
+        dest: /tmp/alertmanager.tar.gz
+        mode: '0644'
+      when: install_alertmanager | default(false)
+      tags: [monitoring, alertmanager]
+
+    - name: "[ALERTMANAGER] Extract"
+      ansible.builtin.unarchive:
+        src: /tmp/alertmanager.tar.gz
+        dest: /opt/
+        remote_src: true
+        creates: "/opt/alertmanager-{{ alertmanager_version }}.linux-amd64"
+      when: install_alertmanager | default(false)
+      tags: [monitoring, alertmanager]
+
+    - name: "[ALERTMANAGER] Create XAI-specific alert rules"
+      ansible.builtin.template:
+        src: templates/xai-alerts.yml.j2
+        dest: /etc/prometheus/rules/xai-alerts.yml
+        mode: '0644'
+      when: install_prometheus | default(false)
+      tags: [monitoring, alertmanager]
+
+  # ===========================================================================
+  # ROLE: UNATTENDED UPGRADES - Automatic security patches
+  # ===========================================================================
+    - name: "[SECURITY] Install unattended-upgrades"
+      ansible.builtin.apt:
+        name:
+          - unattended-upgrades
+          - apt-listchanges
+        state: present
+      tags: [security, unattended]
+
+    - name: "[SECURITY] Configure unattended-upgrades"
+      ansible.builtin.copy:
+        # yamllint disable rule:line-length
+        content: !unsafe |
+          Unattended-Upgrade::Allowed-Origins {
+            "${distro_id}:${distro_codename}";
+            "${distro_id}:${distro_codename}-security";
+            "${distro_id}ESMApps:${distro_codename}-apps-security";
+            "${distro_id}ESM:${distro_codename}-infra-security";
+          };
+
+          Unattended-Upgrade::Package-Blacklist {
+          };
+
+          Unattended-Upgrade::DevRelease "auto";
+          Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+          Unattended-Upgrade::MinimalSteps "true";
+          Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+          Unattended-Upgrade::Remove-Unused-Dependencies "true";
+
+          // DISABLED for blockchain - manual reboot required
+          Unattended-Upgrade::Automatic-Reboot "false";
+        # yamllint enable rule:line-length
+        dest: /etc/apt/apt.conf.d/50unattended-upgrades
+        mode: '0644'
+      tags: [security, unattended]
+
+    - name: "[SECURITY] Enable automatic updates"
+      ansible.builtin.copy:
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Unattended-Upgrade "1";
+          APT::Periodic::AutocleanInterval "7";
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        mode: '0644'
+      tags: [security, unattended]
+
+  # ===========================================================================
+  # ROLE: LOGROTATE - Log management
+  # ===========================================================================
+    - name: "[LOGROTATE] Configure blockchain log rotation"
+      ansible.builtin.copy:
+        content: |
+          /var/log/xai/*.log {
+              daily
+              rotate 7
+              compress
+              delaycompress
+              missingok
+              notifempty
+              create 0640 {{ daemon_user }} {{ daemon_user }}
+          }
+
+          {{ daemon_home }}/logs/*.log {
+              daily
+              rotate 7
+              compress
+              delaycompress
+              missingok
+              notifempty
+              create 0640 {{ daemon_user }} {{ daemon_user }}
+          }
+        dest: /etc/logrotate.d/xai
+        mode: '0644'
+      tags: [logging, logrotate]
+
+    - name: "[LOGROTATE] Configure journald limits"
+      ansible.builtin.file:
+        path: /etc/systemd/journald.conf.d
+        state: directory
+        mode: '0755'
+      tags: [logging, logrotate]
+
+    - name: "[LOGROTATE] Set journald limits"
+      ansible.builtin.copy:
+        content: |
+          [Journal]
+          SystemMaxUse=2G
+          SystemKeepFree=4G
+          SystemMaxFileSize=200M
+          MaxRetentionSec=1week
+        dest: /etc/systemd/journald.conf.d/limits.conf
+        mode: '0644'
+      notify: Reload systemd
+      tags: [logging, logrotate]
+
+  # ===========================================================================
+  # FINAL: Health check and summary
+  # ===========================================================================
+    - name: "[HEALTH] Verify all services running"
+      ansible.builtin.service_facts:
+      tags: [health]
+
+    - name: "[HEALTH] Check XAI node status"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ rpc_port }}/stats"
+        return_content: true
+        timeout: 10
+      register: xai_status
+      ignore_errors: true
+      tags: [health]
+
+    - name: "[HEALTH] Display service status"
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          XAI Infrastructure Status: {{ inventory_hostname }}
+          ============================================
+          Node Exporter: {{ ansible_facts.services['node_exporter.service'].state | default('not installed') }}
+          {% if node_type == 'validator' or node_type == 'node' %}
+          XAI Metrics: {{ ansible_facts.services['xai-metrics.service'].state | default('not installed') }}
+          XAI Monitor: {{ ansible_facts.services['xai-monitor.service'].state | default('not installed') }}
+          {% endif %}
+          WireGuard: {{ ansible_facts.services['wg-quick@wg0.service'].state | default('not configured') }}
+          {% if xai_status is defined and xai_status.status is defined and xai_status.status == 200 %}
+
+          Chain Status:
+          - Height: {{ xai_status.json.chain_height | default('N/A') }}
+          - Finalized: {{ xai_status.json.finalized_height | default('N/A') }}
+          - Peers: {{ xai_status.json.peer_count | default('N/A') }}
+          - Mining: {{ xai_status.json.mining | default('N/A') }}
+          {% else %}
+
+          Chain Status: Unable to connect to node RPC
+          {% endif %}
+          ============================================
+      tags: [health]

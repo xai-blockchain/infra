@@ -1,0 +1,57 @@
+# XAI Prometheus Alert Rules
+# DO NOT EDIT - Managed by Ansible
+# The {{ and }} below are Prometheus template syntax, NOT Jinja2
+{% raw %}
+groups:
+  - name: xai_alerts
+    rules:
+      - alert: XAINodeDown
+        expr: up{job="xai_node"} == 0
+        for: 5m
+        labels:
+          severity: critical
+          chain: xai
+        annotations:
+          summary: "XAI node {{ $labels.instance }} is down"
+          description: "Node has been unreachable for more than 5 minutes"
+
+      - alert: XAIChainStalled
+        expr: increase(xai_chain_height[10m]) == 0
+        for: 5m
+        labels:
+          severity: critical
+          chain: xai
+        annotations:
+          summary: "XAI chain halted"
+          description: "No new blocks in the last 10 minutes"
+
+      - alert: XAIFinalityLag
+        expr: xai_finality_lag > 100
+        for: 10m
+        labels:
+          severity: warning
+          chain: xai
+        annotations:
+          summary: "XAI finality lagging"
+          description: "Finality is {{ $value }} blocks behind chain head"
+
+      - alert: XAILowPeers
+        expr: xai_peer_count < 2
+        for: 5m
+        labels:
+          severity: warning
+          chain: xai
+        annotations:
+          summary: "XAI node has low peer count"
+          description: "Only {{ $value }} peers connected"
+
+      - alert: XAIMiningDown
+        expr: xai_mining_active == 0
+        for: 5m
+        labels:
+          severity: warning
+          chain: xai
+        annotations:
+          summary: "XAI node not mining"
+          description: "Node {{ $labels.node }} is not mining"
+{% endraw %}

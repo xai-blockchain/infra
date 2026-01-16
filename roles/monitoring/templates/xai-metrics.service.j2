@@ -1,0 +1,68 @@
+#
+# xai-metrics.service - XAI Blockchain Metrics Exporter
+#
+# Exposes Prometheus-compatible metrics for XAI nodes.
+# Collects chain height, peer count, mining stats, and system metrics.
+#
+# Managed by Ansible - do not edit directly
+#
+# Variables:
+#   venv_path   - Python virtual environment path
+#   daemon_user - User to run the service as
+#   node_name   - Node identifier for labeling metrics
+#
+
+[Unit]
+Description=XAI Metrics Exporter ({{ node_name }})
+Documentation=https://docs.xaiblockchain.com/monitoring
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User={{ daemon_user }}
+Group={{ daemon_user }}
+
+# Working directory
+WorkingDirectory={{ venv_path | dirname }}
+
+# Environment
+Environment="PATH={{ venv_path }}/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+Environment="XAI_NODE_NAME={{ node_name }}"
+Environment="XAI_METRICS_PORT=9100"
+
+# Main process
+ExecStart={{ venv_path }}/bin/python -m xai.monitoring.metrics_exporter \
+    --node-name {{ node_name }} \
+    --port 9100 \
+    --interval 15
+
+# Restart policy
+Restart=always
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+
+# Resource limits
+MemoryMax=256M
+CPUQuota=25%
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=xai-metrics-{{ node_name }}
+
+[Install]
+WantedBy=multi-user.target

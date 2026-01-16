@@ -1,0 +1,24 @@
+---
+# Default variables for nginx role
+# All variables prefixed with nginx_ per ansible-lint convention
+
+nginx_worker_processes: auto
+nginx_worker_connections: 4096
+
+# Non-destructive mode settings
+# Set to true to force full nginx reconfiguration (overwrites existing)
+nginx_force_install: false
+
+# Set to true to manage nginx.conf (default: false to preserve existing)
+nginx_manage_main_config: false
+
+# Set to true to deploy upstream configs to conf.d (default: true)
+nginx_manage_upstreams: true
+
+# Default ports (overridden by chain vars)
+nginx_rpc_port: 26657
+nginx_rest_port: 1317
+nginx_grpc_port: 9090
+nginx_ws_port: 26657
+nginx_explorer_port: 8082
+nginx_faucet_port: 8081

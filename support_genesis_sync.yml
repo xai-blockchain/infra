@@ -1,0 +1,122 @@
+---
+# XAI Genesis Sync Playbook
+#
+# Performs a full sync from genesis block. Use for archive nodes or
+# when you need complete chain history.
+#
+# WARNING: This can take a very long time depending on chain height!
+#
+# Usage:
+#   ansible-playbook -i inventory/testnet.yml playbooks/genesis-sync.yml --limit xai_node1
+#
+# Variables:
+#   backup_existing: Whether to backup existing data (default: true)
+#   confirm_genesis_sync: Must be set to 'yes' to proceed (safety check)
+
+- name: XAI Genesis Sync (Full History)
+  hosts: all
+  become: true
+  vars:
+    backup_existing: true
+    genesis_url: "https://artifacts.xaiblockchain.com/{{ chain_id }}/genesis.json"
+    chain_id: "xai-mvp-testnet-1"
+
+  tasks:
+    - name: Safety check - require explicit confirmation
+      ansible.builtin.fail:
+        msg: |
+          Genesis sync will wipe all data and sync from block 0.
+          This can take many hours or days!
+
+          To proceed, add: -e confirm_genesis_sync=yes
+      when: confirm_genesis_sync | default('no') != 'yes'
+
+    - name: Stop XAI service
+      ansible.builtin.service:
+        name: "{{ service_name }}"
+        state: stopped
+
+    - name: Wait for service to fully stop
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: Check if data directory exists
+      ansible.builtin.stat:
+        path: "{{ daemon_home }}/data"
+      register: data_dir_stat
+
+    - name: Backup existing data directory
+      ansible.builtin.command:
+        cmd: "mv {{ daemon_home }}/data {{ daemon_home }}/data.pre-genesis.{{ ansible_date_time.epoch }}"
+      when:
+        - backup_existing | bool
+        - data_dir_stat.stat.exists
+      changed_when: true
+
+    - name: Create fresh data directory
+      ansible.builtin.file:
+        path: "{{ daemon_home }}/data"
+        state: directory
+        owner: "{{ daemon_user }}"
+        group: "{{ daemon_user }}"
+        mode: '0755'
+
+    - name: Download genesis.json from R2
+      ansible.builtin.get_url:
+        url: "{{ genesis_url }}"
+        dest: "{{ daemon_home }}/data/genesis.json"
+        mode: '0644'
+        owner: "{{ daemon_user }}"
+        group: "{{ daemon_user }}"
+      register: genesis_download
+      failed_when: false
+
+    - name: Verify genesis.json exists locally (fallback)
+      ansible.builtin.stat:
+        path: "{{ xai_mvp_home | default('/home/ubuntu/xai-mvp') }}/genesis.json"
+      register: local_genesis
+      when: genesis_download is failed
+
+    - name: Copy local genesis.json as fallback
+      ansible.builtin.copy:
+        src: "{{ xai_mvp_home | default('/home/ubuntu/xai-mvp') }}/genesis.json"
+        dest: "{{ daemon_home }}/data/genesis.json"
+        remote_src: true
+        owner: "{{ daemon_user }}"
+        group: "{{ daemon_user }}"
+        mode: '0644'
+      when: genesis_download is failed and local_genesis.stat.exists
+
+    - name: Verify genesis file is valid JSON
+      ansible.builtin.command:
+        cmd: "python3 -m json.tool {{ daemon_home }}/data/genesis.json"
+      changed_when: false
+
+    - name: Start XAI service
+      ansible.builtin.service:
+        name: "{{ service_name }}"
+        state: started
+
+    - name: Wait for node to start responding
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ rpc_port }}/stats"
+        return_content: true
+      register: node_status
+      until: node_status.status == 200
+      retries: 60
+      delay: 5
+
+    - name: Display genesis sync started
+      ansible.builtin.debug:
+        msg: |
+          Genesis sync started!
+          Node: {{ node_name }}
+          Service: {{ service_name }}
+
+          Current height: {{ (node_status.content | from_json).chain_height }}
+
+          Monitor progress with:
+            ssh {{ inventory_hostname }} "journalctl -u {{ service_name }} -f"
+
+          Or check height:
+            ssh {{ inventory_hostname }} "curl -s http://127.0.0.1:{{ rpc_port }}/stats | jq .chain_height"

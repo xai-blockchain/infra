@@ -1,0 +1,38 @@
+# Ansible
+*.retry
+.cache/
+*.pyc
+__pycache__/
+
+# Secrets - NEVER commit
+secrets/
+*.vault
+*vault*.yml
+*secret*.yml
+*.pem
+*.key
+id_rsa*
+*.gpg
+
+# Local overrides
+host_vars/local/
+inventory/local*.yml
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temporary
+tmp/
+.tmp/

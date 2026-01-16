@@ -1,0 +1,196 @@
+---
+# XAI State Sync Playbook
+#
+# Fast-syncs a node using the latest snapshot. This is the recommended
+# way to quickly sync a new node or recover a stalled node.
+#
+# Note: XAI doesn't have Tendermint-style state-sync, so this uses
+# snapshot restore under the hood but with simpler semantics.
+#
+# Usage:
+#   ansible-playbook -i inventory/testnet.yml playbooks/state-sync.yml --limit xai_node1
+#
+# Variables:
+#   sync_from_peers: Try to sync from peer nodes first (default: false)
+#   force_snapshot: Always use snapshot even if node is syncing (default: false)
+
+- name: XAI State Sync (Fast Sync)
+  hosts: all
+  become: true
+  vars:
+    artifacts_base_url: "https://artifacts.xaiblockchain.com"
+    chain_id: "xai-mvp-testnet-1"
+    sync_from_peers: false
+    force_snapshot: false
+    stall_threshold_blocks: 10
+    stall_check_interval: 30
+
+  tasks:
+    - name: Check current node status
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ rpc_port }}/stats"
+        return_content: true
+      register: current_status
+      failed_when: false
+
+    - name: Set current height fact
+      ansible.builtin.set_fact:
+        current_height: "{{ (current_status.content | from_json).chain_height | default(0) }}"
+        current_peers: "{{ (current_status.content | from_json).peers | default(0) }}"
+      when: current_status is succeeded
+
+    - name: Get network height from sentry
+      ansible.builtin.uri:
+        url: "http://{{ hostvars['xai_sentry1'].ansible_host | default('127.0.0.1') }}:12570/stats"
+        return_content: true
+      register: network_status
+      failed_when: false
+      delegate_to: localhost
+      become: false
+
+    - name: Set network height fact
+      ansible.builtin.set_fact:
+        network_height: "{{ (network_status.content | from_json).chain_height | default(0) }}"
+      when: network_status is succeeded
+
+    - name: Calculate sync lag
+      ansible.builtin.set_fact:
+        sync_lag: "{{ (network_height | default(0) | int) - (current_height | default(0) | int) }}"
+      when: network_height is defined and current_height is defined
+
+    - name: Display current sync status
+      ansible.builtin.debug:
+        msg: |
+          Node: {{ node_name }}
+          Current height: {{ current_height | default('unknown') }}
+          Network height: {{ network_height | default('unknown') }}
+          Sync lag: {{ sync_lag | default('unknown') }} blocks
+          Peers: {{ current_peers | default('unknown') }}
+
+    - name: Check if node is already synced
+      ansible.builtin.debug:
+        msg: "Node is already synced (lag: {{ sync_lag }} blocks). Use -e force_snapshot=true to force resync."
+      when:
+        - sync_lag is defined
+        - sync_lag | int < 100
+        - not force_snapshot | bool
+
+    - name: Skip if already synced
+      ansible.builtin.meta: end_play
+      when:
+        - sync_lag is defined
+        - sync_lag | int < 100
+        - not force_snapshot | bool
+
+    # If significantly behind, use snapshot restore
+    - name: Get latest snapshot info
+      ansible.builtin.uri:
+        url: "{{ artifacts_base_url }}/{{ chain_id }}/snapshots/latest.json"
+        return_content: true
+      register: snapshot_info
+      failed_when: false
+
+    - name: Set snapshot facts
+      ansible.builtin.set_fact:
+        snapshot_url: "{{ (snapshot_info.content | from_json).url }}"
+        snapshot_height: "{{ (snapshot_info.content | from_json).height }}"
+      when: snapshot_info is succeeded
+
+    - name: Decide sync method
+      ansible.builtin.debug:
+        msg: |
+          Sync method: {{ 'SNAPSHOT' if (snapshot_height | default(0) | int) > (current_height | default(0) | int) else 'PEER_SYNC' }}
+          Snapshot height: {{ snapshot_height | default('unavailable') }}
+          Current height: {{ current_height | default(0) }}
+
+    - name: Stop XAI service
+      ansible.builtin.service:
+        name: "{{ service_name }}"
+        state: stopped
+      when: snapshot_height is defined and (snapshot_height | int) > (current_height | default(0) | int)
+
+    - name: Check if data directory exists
+      ansible.builtin.stat:
+        path: "{{ daemon_home }}/data"
+      register: data_dir_stat
+      when: snapshot_height is defined and (snapshot_height | int) > (current_height | default(0) | int)
+
+    - name: Backup existing data
+      ansible.builtin.command:
+        cmd: "mv {{ daemon_home }}/data {{ daemon_home }}/data.statesync.{{ ansible_date_time.epoch }}"
+      when:
+        - snapshot_height is defined
+        - (snapshot_height | int) > (current_height | default(0) | int)
+        - data_dir_stat.stat.exists | default(false)
+      changed_when: true
+
+    - name: Create fresh data directory
+      ansible.builtin.file:
+        path: "{{ daemon_home }}/data"
+        state: directory
+        owner: "{{ daemon_user }}"
+        group: "{{ daemon_user }}"
+        mode: '0755'
+      when: snapshot_height is defined and (snapshot_height | int) > (current_height | default(0) | int)
+
+    - name: Download snapshot
+      ansible.builtin.get_url:
+        url: "{{ snapshot_url }}"
+        dest: "/tmp/xai-statesync.tar.lz4"
+        mode: '0644'
+        timeout: 600
+      when: snapshot_height is defined and (snapshot_height | int) > (current_height | default(0) | int)
+
+    - name: Extract snapshot
+      ansible.builtin.shell: |
+        set -o pipefail
+        lz4 -d /tmp/xai-statesync.tar.lz4 | tar -xf - -C {{ daemon_home }}/data
+      args:
+        executable: /bin/bash
+      when: snapshot_height is defined and (snapshot_height | int) > (current_height | default(0) | int)
+      changed_when: true
+
+    - name: Set ownership
+      ansible.builtin.file:
+        path: "{{ daemon_home }}/data"
+        owner: "{{ daemon_user }}"
+        group: "{{ daemon_user }}"
+        recurse: true
+      when: snapshot_height is defined and (snapshot_height | int) > (current_height | default(0) | int)
+
+    - name: Clean up snapshot file
+      ansible.builtin.file:
+        path: "/tmp/xai-statesync.tar.lz4"
+        state: absent
+
+    - name: Start XAI service
+      ansible.builtin.service:
+        name: "{{ service_name }}"
+        state: started
+
+    - name: Wait for node to respond
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ rpc_port }}/stats"
+        return_content: true
+      register: final_status
+      until: final_status.status == 200
+      retries: 30
+      delay: 2
+
+    - name: Display sync result
+      ansible.builtin.debug:
+        msg: |
+          State sync complete!
+          Node: {{ node_name }}
+          New height: {{ (final_status.content | from_json).chain_height }}
+          Peers: {{ (final_status.content | from_json).peers }}
+
+          Node will continue syncing from peers to reach network height.
+
+    - name: Clean up old backups (keep last 2)
+      ansible.builtin.shell: |
+        set -o pipefail
+        ls -dt {{ daemon_home }}/data.statesync.* 2>/dev/null | tail -n +3 | xargs -r rm -rf || true
+      args:
+        executable: /bin/bash
+      changed_when: false

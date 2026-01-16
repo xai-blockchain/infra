@@ -1,0 +1,104 @@
+---
+all:
+  children:
+    primary_nodes:
+      hosts:
+        xai_node1:
+          ansible_host: 54.39.129.11
+          node_name: node1
+          node_type: node
+          daemon_home: /home/ubuntu/xai-mvp/node1
+          rpc_port: 12545
+          p2p_port: 12333
+          mining: true
+          service_name: xai-mvp-node1
+          miner_address: xaitest1gxt2dhojrmqqolmvrdpln7b4avwy5bfm
+          peers:
+            - "http://127.0.0.1:12555"
+            - "http://10.10.0.4:12546"
+            - "http://10.10.0.4:12556"
+        xai_node2:
+          ansible_host: 54.39.129.11
+          node_name: node2
+          node_type: node
+          daemon_home: /home/ubuntu/xai-mvp/node2
+          rpc_port: 12555
+          p2p_port: 12334
+          mining: true
+          service_name: xai-mvp-node2
+          miner_address: xaitest1gxt2dhojrmqqolmvrdpln7b4avwy5bfm
+          peers:
+            - "http://127.0.0.1:12545"
+            - "http://10.10.0.4:12546"
+            - "http://10.10.0.4:12556"
+
+    primary_sentries:
+      hosts:
+        xai_sentry1:
+          ansible_host: 54.39.129.11
+          node_name: sentry1
+          node_type: sentry
+          daemon_home: /home/ubuntu/xai-mvp/sentry1
+          rpc_port: 12570
+          p2p_port: 12371
+          mining: false
+          service_name: xai-sentry1
+          peers:
+            - "http://127.0.0.1:12545"
+            - "http://127.0.0.1:12555"
+        xai_sentry2:
+          ansible_host: 54.39.129.11
+          node_name: sentry2
+          node_type: sentry
+          daemon_home: /home/ubuntu/xai-mvp/sentry2
+          rpc_port: 12571
+          p2p_port: 12372
+          mining: false
+          service_name: xai-sentry2
+          peers:
+            - "http://127.0.0.1:12545"
+            - "http://127.0.0.1:12555"
+
+    secondary_nodes:
+      hosts:
+        xai_node3:
+          ansible_host: 139.99.149.160
+          node_name: node3
+          node_type: validator
+          daemon_home: /home/ubuntu/xai-mvp/node3
+          rpc_port: 12546
+          p2p_port: 12335
+          mining: false
+          service_name: xai-mvp-node3
+          peers:
+            - "http://10.10.0.3:12545"
+            - "http://10.10.0.3:12555"
+            - "http://127.0.0.1:12556"
+        xai_node4:
+          ansible_host: 139.99.149.160
+          node_name: node4
+          node_type: validator
+          daemon_home: /home/ubuntu/xai-mvp/node4
+          rpc_port: 12556
+          p2p_port: 12336
+          mining: false
+          service_name: xai-mvp-node4
+          peers:
+            - "http://10.10.0.3:12545"
+            - "http://10.10.0.3:12555"
+            - "http://127.0.0.1:12546"
+
+  vars:
+    ansible_user: ubuntu
+    ansible_port: 22
+    ansible_python_interpreter: /usr/bin/python3
+    ansible_ssh_private_key_file: /home/hudson/.ssh/id_ed25519_testnet
+    ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+    chain_id: xai-mvp-testnet-1
+    daemon_user: ubuntu
+    venv_path: /home/ubuntu/xai/venv
+    xai_src: /home/ubuntu/xai
+    xai_home: /home/ubuntu/xai
+    xai_mvp_home: /home/ubuntu/xai-mvp
+    vpn_network: 10.10.0.0/24
+    ufw_enabled: false

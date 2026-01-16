@@ -1,0 +1,46 @@
+# XAI Node Configuration
+# Managed by Ansible - DO NOT EDIT MANUALLY
+# Node: {{ node_name }} ({{ node_type }})
+
+chain_id: {{ chain_id }}
+node_name: {{ node_name }}
+
+# Network
+rpc_port: {{ rpc_port }}
+p2p_port: {{ p2p_port }}
+rpc_host: "0.0.0.0"
+
+# Data storage
+data_dir: "{{ daemon_home }}/data"
+log_dir: "{{ daemon_home }}/logs"
+
+# Mining
+mining: {{ mining | default(false) | lower }}
+{% if mining | default(false) %}
+miner_address: "{{ miner_address | default('') }}"
+{% endif %}
+
+# Consensus
+finality_enabled: true
+finality_threshold: 67
+
+# Peers
+{% if node_type == 'sentry' %}
+# Sentry node - accepts public connections
+pex_enabled: true
+max_peers: 50
+{% elif node_type == 'validator' %}
+# Validator - only connects to sentries via VPN
+pex_enabled: false
+private_peers:
+  - "10.10.0.3:12371"  # sentry1
+  - "10.10.0.3:12372"  # sentry2
+{% else %}
+# Regular node
+pex_enabled: true
+max_peers: 25
+{% endif %}
+
+# Logging
+log_level: "INFO"
+log_format: "json"

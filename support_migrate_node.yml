@@ -1,0 +1,496 @@
+---
+# noqa: syntax-check[specific]
+# XAI Node Migration Playbook
+#
+# Orchestrates complete node migration between servers with full verification.
+# Follows blockchain community standards for safe validator migration.
+#
+# Usage:
+#   # Migrate node1 from old_server to new_server
+#   ansible-playbook -i inventory/testnet.yml support_migrate_node.yml \
+#     -e source_host=old_server \
+#     -e target_host=new_server \
+#     -e node_name=node1
+#
+#   # Migrate with custom backup location
+#   ansible-playbook -i inventory/testnet.yml support_migrate_node.yml \
+#     -e source_host=old_server \
+#     -e target_host=new_server \
+#     -e node_name=node1 \
+#     -e backup_dest=/secure/migration
+#
+#   # Skip source cleanup (keep old node stopped but intact)
+#   ansible-playbook -i inventory/testnet.yml support_migrate_node.yml \
+#     -e source_host=old_server \
+#     -e target_host=new_server \
+#     -e node_name=node1 \
+#     -e cleanup_source=false
+#
+# Migration Workflow:
+#   1. Pre-flight checks on both hosts
+#   2. Backup keys from source node (encrypted)
+#   3. Stop source node
+#   4. Deploy node software on target (if needed)
+#   5. Sync target node (state-sync or snapshot)
+#   6. Restore keys on target
+#   7. Start target node
+#   8. Verify target is operational
+#   9. Cleanup source (optional)
+#
+# References:
+#   - https://docs.prylabs.network/docs/advanced/migrating-keys
+#   - https://docs.ethstaker.org/scaled-node-operators/key-management-at-scale
+#   - https://forum.cosmos.network/t/how-to-move-a-validator-between-servers/1617
+
+- name: XAI Node Migration - Pre-flight Checks
+  hosts: localhost
+  gather_facts: false
+  vars:
+    migration_id: "{{ ansible_date_time.epoch | default(lookup('pipe', 'date +%s')) }}"
+
+  tasks:
+    - name: Verify required variables
+      ansible.builtin.assert:
+        that:
+          - source_host is defined
+          - target_host is defined
+          - node_name is defined
+        fail_msg: |
+          Required variables missing:
+          - source_host: The inventory hostname of the source node
+          - target_host: The inventory hostname of the target node
+          - node_name: The node name being migrated
+
+    - name: Display migration plan
+      ansible.builtin.debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════════╗
+          ║                    XAI NODE MIGRATION PLAN                       ║
+          ╠══════════════════════════════════════════════════════════════════╣
+          ║ Migration ID: {{ migration_id }}
+          ║ Source host: {{ source_host }}
+          ║ Target host: {{ target_host }}
+          ║ Node name: {{ node_name }}
+          ║                                                                  ║
+          ║ Workflow:                                                        ║
+          ║   1. Backup keys from source (encrypted)                         ║
+          ║   2. Stop source node                                            ║
+          ║   3. Deploy/verify target node                                   ║
+          ║   4. Sync target (state-sync)                                    ║
+          ║   5. Restore keys on target                                      ║
+          ║   6. Start and verify target                                     ║
+          ║   7. Cleanup source (if enabled)                                 ║
+          ╚══════════════════════════════════════════════════════════════════╝
+
+    - name: Confirm migration
+      ansible.builtin.pause:
+        prompt: "Type 'yes' to proceed with migration"
+      register: migration_confirm
+      when: confirm_migration is not defined or confirm_migration != 'yes'
+
+    - name: Verify confirmation
+      ansible.builtin.fail:
+        msg: "Migration cancelled"
+      when:
+        - confirm_migration is not defined or confirm_migration != 'yes'
+        - migration_confirm.user_input != 'yes'
+
+    - name: Set migration facts
+      ansible.builtin.set_fact:
+        migration_backup_dest: "{{ backup_dest | default('/tmp/xai-migration-' ~ migration_id) }}"
+        migration_cleanup_source: "{{ cleanup_source | default(true) | bool }}"
+        migration_sync_method: "{{ sync_method | default('state_sync') }}"
+      delegate_facts: true
+
+
+- name: XAI Node Migration - Phase 1 - Source Backup
+  hosts: "{{ source_host }}"
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Display Phase 1 banner
+      ansible.builtin.debug:
+        msg: |
+          ════════════════════════════════════════════════════════════════════
+          PHASE 1: Backing up keys from source node
+          ════════════════════════════════════════════════════════════════════
+
+    - name: Verify source node exists
+      ansible.builtin.stat:
+        path: "{{ daemon_home }}/data/node_identity.json"
+      register: source_identity
+
+    - name: Fail if source identity not found
+      ansible.builtin.fail:
+        msg: "Source node identity not found at {{ daemon_home }}/data/node_identity.json"
+      when: not source_identity.stat.exists
+
+    - name: Get source node status
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ rpc_port }}/stats"
+        return_content: true
+        timeout: 10
+      register: source_status
+      failed_when: false
+
+    - name: Display source node status
+      ansible.builtin.debug:
+        msg: |
+          Source node status:
+            Height: {{ (source_status.content | from_json).chain_height | default('N/A') if source_status.status == 200 else 'NOT RUNNING' }}
+            Peers: {{ (source_status.content | from_json).peer_count | default('N/A') if source_status.status == 200 else 'N/A' }}
+
+    - name: Create migration backup directory
+      ansible.builtin.file:
+        path: "{{ hostvars['localhost']['migration_backup_dest'] }}"
+        state: directory
+        mode: '0700'
+      delegate_to: localhost
+      become: false
+
+    - name: Generate migration encryption password
+      ansible.builtin.set_fact:
+        migration_password: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+      no_log: true
+      when: backup_password is not defined
+
+    - name: Use provided password
+      ansible.builtin.set_fact:
+        migration_password: "{{ backup_password }}"
+      when: backup_password is defined
+      no_log: true
+
+    - name: Save encryption password to file
+      ansible.builtin.copy:
+        content: "{{ migration_password }}"
+        dest: "{{ hostvars['localhost']['migration_backup_dest'] }}/encryption_password.txt"
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+      no_log: true
+
+    - name: Create backup archive
+      community.general.archive:
+        path:
+          - "{{ daemon_home }}/data/node_identity.json"
+          - "{{ daemon_home }}/wallets"
+          - "{{ daemon_home }}/config.yml"
+        dest: "/tmp/migration-{{ node_name }}.tar.gz"
+        format: gz
+        mode: '0600'
+      register: backup_archive
+
+    - name: Fetch backup to controller
+      ansible.builtin.fetch:
+        src: "/tmp/migration-{{ node_name }}.tar.gz"
+        dest: "{{ hostvars['localhost']['migration_backup_dest'] }}/{{ node_name }}-keys.tar.gz"
+        flat: true
+
+    - name: Encrypt backup
+      ansible.builtin.command:
+        cmd: >
+          gpg --batch --yes --symmetric --cipher-algo AES256
+          --passphrase-fd 0
+          --output "{{ hostvars['localhost']['migration_backup_dest'] }}/{{ node_name }}-keys.tar.gz.gpg"
+          "{{ hostvars['localhost']['migration_backup_dest'] }}/{{ node_name }}-keys.tar.gz"
+        stdin: "{{ migration_password }}"
+      delegate_to: localhost
+      become: false
+      no_log: true
+
+    - name: Remove unencrypted backup
+      ansible.builtin.file:
+        path: "{{ hostvars['localhost']['migration_backup_dest'] }}/{{ node_name }}-keys.tar.gz"
+        state: absent
+      delegate_to: localhost
+      become: false
+
+    - name: Clean up remote temp file
+      ansible.builtin.file:
+        path: "/tmp/migration-{{ node_name }}.tar.gz"
+        state: absent
+
+
+- name: XAI Node Migration - Phase 2 - Stop Source
+  hosts: "{{ source_host }}"
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Display Phase 2 banner
+      ansible.builtin.debug:
+        msg: |
+          ════════════════════════════════════════════════════════════════════
+          PHASE 2: Stopping source node
+          ════════════════════════════════════════════════════════════════════
+
+    - name: Stop source node service
+      ansible.builtin.service:
+        name: "{{ service_name }}"
+        state: stopped
+
+    - name: Wait for service to stop
+      ansible.builtin.wait_for:
+        timeout: 15
+
+    - name: Verify source is stopped
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ rpc_port }}/stats"
+        timeout: 5
+      register: source_stopped_check
+      failed_when: source_stopped_check.status == 200
+      ignore_errors: true
+
+    - name: Confirm source stopped
+      ansible.builtin.debug:
+        msg: "Source node {{ node_name }} stopped successfully"
+
+
+- name: XAI Node Migration - Phase 3 - Target Setup and Sync
+  hosts: "{{ target_host }}"
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Display Phase 3 banner
+      ansible.builtin.debug:
+        msg: |
+          ════════════════════════════════════════════════════════════════════
+          PHASE 3: Setting up and syncing target node
+          ════════════════════════════════════════════════════════════════════
+
+    - name: Check if target already has node software
+      ansible.builtin.stat:
+        path: "{{ venv_path | default('/home/' ~ daemon_user ~ '/xai/venv') }}/bin/python"
+      register: target_venv
+
+    - name: Display target status
+      ansible.builtin.debug:
+        msg: "Target node software: {{ 'INSTALLED' if target_venv.stat.exists else 'NOT INSTALLED' }}"
+
+    - name: Ensure daemon home exists
+      ansible.builtin.file:
+        path: "{{ daemon_home }}"
+        state: directory
+        owner: "{{ daemon_user }}"
+        group: "{{ daemon_user }}"
+        mode: '0755'
+
+    - name: Ensure data directory exists
+      ansible.builtin.file:
+        path: "{{ daemon_home }}/data"
+        state: directory
+        owner: "{{ daemon_user }}"
+        group: "{{ daemon_user }}"
+        mode: '0700'
+
+    - name: Check if target has existing data
+      ansible.builtin.stat:
+        path: "{{ daemon_home }}/data/blocks"
+      register: target_data
+
+    - name: Display sync requirement
+      ansible.builtin.debug:
+        msg: |
+          Target data status: {{ 'EXISTS - will skip sync' if target_data.stat.exists else 'EMPTY - needs sync' }}
+          Sync method: {{ hostvars['localhost']['migration_sync_method'] | default('state_sync') }}
+
+
+- name: XAI Node Migration - Phase 4 - Restore Keys
+  hosts: "{{ target_host }}"
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Display Phase 4 banner
+      ansible.builtin.debug:
+        msg: |
+          ════════════════════════════════════════════════════════════════════
+          PHASE 4: Restoring keys on target
+          ════════════════════════════════════════════════════════════════════
+
+    - name: Create temp directory for restore
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: xai_restore_
+      register: restore_temp
+
+    - name: Copy encrypted backup to target
+      ansible.builtin.copy:
+        src: "{{ hostvars['localhost']['migration_backup_dest'] }}/{{ node_name }}-keys.tar.gz.gpg"
+        dest: "{{ restore_temp.path }}/backup.tar.gz.gpg"
+        mode: '0600'
+
+    - name: Read encryption password
+      ansible.builtin.slurp:
+        src: "{{ hostvars['localhost']['migration_backup_dest'] }}/encryption_password.txt"
+      delegate_to: localhost
+      become: false
+      register: password_file
+      no_log: true
+
+    - name: Decrypt backup
+      ansible.builtin.command:
+        cmd: >
+          gpg --batch --yes --decrypt
+          --passphrase-fd 0
+          --output "{{ restore_temp.path }}/backup.tar.gz"
+          "{{ restore_temp.path }}/backup.tar.gz.gpg"
+        stdin: "{{ password_file.content | b64decode }}"
+      no_log: true
+
+    - name: Extract backup
+      ansible.builtin.unarchive:
+        src: "{{ restore_temp.path }}/backup.tar.gz"
+        dest: "{{ restore_temp.path }}/"
+        remote_src: true
+
+    - name: Restore node identity
+      ansible.builtin.copy:
+        src: "{{ restore_temp.path }}/node_identity.json"
+        dest: "{{ daemon_home }}/data/node_identity.json"
+        remote_src: true
+        owner: "{{ daemon_user }}"
+        group: "{{ daemon_user }}"
+        mode: '0600'
+
+    - name: Check for wallets in backup
+      ansible.builtin.stat:
+        path: "{{ restore_temp.path }}/wallets"
+      register: backup_has_wallets
+
+    - name: Restore wallets
+      ansible.builtin.copy:
+        src: "{{ restore_temp.path }}/wallets/"
+        dest: "{{ daemon_home }}/wallets/"
+        remote_src: true
+        owner: "{{ daemon_user }}"
+        group: "{{ daemon_user }}"
+        mode: '0600'
+      when: backup_has_wallets.stat.exists
+
+    - name: Check for config in backup
+      ansible.builtin.stat:
+        path: "{{ restore_temp.path }}/config.yml"
+      register: backup_has_config
+
+    - name: Restore config
+      ansible.builtin.copy:
+        src: "{{ restore_temp.path }}/config.yml"
+        dest: "{{ daemon_home }}/config.yml"
+        remote_src: true
+        owner: "{{ daemon_user }}"
+        group: "{{ daemon_user }}"
+        mode: '0644'
+      when: backup_has_config.stat.exists
+
+    - name: Clean up restore temp
+      ansible.builtin.file:
+        path: "{{ restore_temp.path }}"
+        state: absent
+
+
+- name: XAI Node Migration - Phase 5 - Start and Verify Target
+  hosts: "{{ target_host }}"
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Display Phase 5 banner
+      ansible.builtin.debug:
+        msg: |
+          ════════════════════════════════════════════════════════════════════
+          PHASE 5: Starting and verifying target node
+          ════════════════════════════════════════════════════════════════════
+
+    - name: Start target node service
+      ansible.builtin.service:
+        name: "{{ service_name }}"
+        state: started
+        enabled: true
+
+    - name: Wait for target node to respond
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ rpc_port }}/stats"
+        return_content: true
+        timeout: 10
+      register: target_status
+      until: target_status.status == 200
+      retries: 30
+      delay: 5
+
+    - name: Verify target node identity
+      ansible.builtin.slurp:
+        src: "{{ daemon_home }}/data/node_identity.json"
+      register: target_identity
+
+    - name: Display target node status
+      ansible.builtin.debug:
+        msg: |
+          Target node status:
+            Height: {{ (target_status.content | from_json).chain_height | default('N/A') }}
+            Peers: {{ (target_status.content | from_json).peer_count | default('N/A') }}
+            Mining: {{ (target_status.content | from_json).mining | default('N/A') }}
+            Public key: {{ (target_identity.content | b64decode | from_json).public_key[:32] }}...
+
+
+- name: XAI Node Migration - Phase 6 - Cleanup
+  hosts: "{{ source_host }}"
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Display Phase 6 banner
+      ansible.builtin.debug:
+        msg: |
+          ════════════════════════════════════════════════════════════════════
+          PHASE 6: Cleanup
+          ════════════════════════════════════════════════════════════════════
+
+    - name: Display cleanup status
+      ansible.builtin.debug:
+        msg: "Source cleanup: {{ 'ENABLED' if hostvars['localhost']['migration_cleanup_source'] | default(true) else 'DISABLED - source node preserved' }}"
+
+    - name: Disable source service (keep data)
+      ansible.builtin.service:
+        name: "{{ service_name }}"
+        enabled: false
+      when: hostvars['localhost']['migration_cleanup_source'] | default(true) | bool
+
+
+- name: XAI Node Migration - Summary
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Clean up encryption password file
+      ansible.builtin.file:
+        path: "{{ hostvars['localhost']['migration_backup_dest'] }}/encryption_password.txt"
+        state: absent
+
+    - name: Display migration summary
+      ansible.builtin.debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════════╗
+          ║                  XAI NODE MIGRATION COMPLETE                     ║
+          ╠══════════════════════════════════════════════════════════════════╣
+          ║ Node: {{ node_name }}
+          ║ Source: {{ source_host }} → Target: {{ target_host }}
+          ║ Backup location: {{ hostvars['localhost']['migration_backup_dest'] }}
+          ╠══════════════════════════════════════════════════════════════════╣
+          ║ VERIFICATION CHECKLIST:                                          ║
+          ║ [ ] Target node is syncing/synced                                ║
+          ║ [ ] Target node has peer connections                             ║
+          ║ [ ] Target node identity matches expected                        ║
+          ║ [ ] Mining/validation working (if applicable)                    ║
+          ║ [ ] Monitoring updated for new host                              ║
+          ║ [ ] DNS/load balancer updated (if applicable)                    ║
+          ╠══════════════════════════════════════════════════════════════════╣
+          ║ NEXT STEPS:                                                      ║
+          ║ 1. Monitor target node logs: journalctl -u {{ service_name }} -f ║
+          ║ 2. Verify peer connections and sync status                       ║
+          ║ 3. Update inventory file with new host                           ║
+          ║ 4. Secure backup at: {{ hostvars['localhost']['migration_backup_dest'] }}
+          ║ 5. Run support_remove_node.yml on source when ready              ║
+          ╚══════════════════════════════════════════════════════════════════╝

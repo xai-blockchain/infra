@@ -1,0 +1,55 @@
+---
+# Rollback XAI code to previous version
+# Usage: ansible-playbook -i inventory/testnet.yml playbooks/rollback.yml
+
+- name: Rollback XAI code
+  hosts: nodes
+  become: yes
+  serial: 1
+  tasks:
+    - name: Get current git commit
+      ansible.builtin.command:
+        cmd: git rev-parse HEAD
+        chdir: "{{ xai_home }}"
+      register: current_commit
+      changed_when: false
+
+    - name: Get previous git commit
+      ansible.builtin.command:
+        cmd: git rev-parse HEAD~1
+        chdir: "{{ xai_home }}"
+      register: previous_commit
+      changed_when: false
+
+    - name: Display rollback info
+      ansible.builtin.debug:
+        msg: "Rolling back {{ node_name }} from {{ current_commit.stdout[:8] }} to {{ previous_commit.stdout[:8] }}"
+
+    - name: Stop node service
+      ansible.builtin.service:
+        name: "xai-{{ node_name }}"
+        state: stopped
+
+    - name: Checkout previous commit
+      ansible.builtin.command:
+        cmd: git checkout HEAD~1
+        chdir: "{{ xai_home }}"
+      become_user: "{{ daemon_user }}"
+
+    - name: Start node service
+      ansible.builtin.service:
+        name: "xai-{{ node_name }}"
+        state: started
+
+    - name: Wait for node to start
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ rpc_port }}/stats"
+        return_content: yes
+      register: node_status
+      until: node_status.status == 200
+      retries: 30
+      delay: 10
+
+    - name: Confirm rollback
+      ansible.builtin.debug:
+        msg: "{{ node_name }} rolled back - running at height {{ node_status.json.chain_height }}"

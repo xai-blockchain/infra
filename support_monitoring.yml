@@ -1,0 +1,249 @@
+---
+# XAI Monitoring Setup - Prometheus metrics and alerting
+#
+# Deploys node_exporter, XAI metrics exporter, and monitoring scripts.
+#
+# Usage:
+#   ansible-playbook -i inventory/testnet.yml support_monitoring.yml
+#   ansible-playbook -i inventory/testnet.yml support_monitoring.yml --limit xai_node1
+
+- name: XAI Monitoring Stack
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    node_exporter_version: "{{ node_exporter_version | default('1.7.0') }}"
+    node_exporter_port: "{{ node_exporter_port | default(9100) }}"
+    xai_metrics_port: "{{ xai_metrics_port | default(9302) }}"
+    vpn_network: "{{ vpn_network | default('10.10.0.0/24') }}"
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Restart node_exporter
+      ansible.builtin.service:
+        name: node_exporter
+        state: restarted
+
+    - name: Restart xai_metrics
+      ansible.builtin.service:
+        name: xai-metrics
+        state: restarted
+
+    - name: Restart xai_monitor
+      ansible.builtin.service:
+        name: xai-monitor
+        state: restarted
+
+  tasks:
+    # =========================================================================
+    # Node Exporter - System metrics
+    # =========================================================================
+    - name: Create prometheus user
+      ansible.builtin.user:
+        name: prometheus
+        shell: /usr/sbin/nologin
+        create_home: false
+        system: true
+      tags: [node_exporter]
+
+    - name: Download node_exporter
+      ansible.builtin.get_url:
+        url: >-
+          https://github.com/prometheus/node_exporter/releases/download/v{{
+          node_exporter_version }}/node_exporter-{{
+          node_exporter_version }}.linux-amd64.tar.gz
+        dest: /tmp/node_exporter.tar.gz
+        mode: '0644'
+      tags: [node_exporter]
+
+    - name: Extract node_exporter
+      ansible.builtin.unarchive:
+        src: /tmp/node_exporter.tar.gz
+        dest: /opt/
+        remote_src: true
+        creates: "/opt/node_exporter-{{ node_exporter_version }}.linux-amd64"
+      tags: [node_exporter]
+
+    - name: Remove old node_exporter binary if exists
+      ansible.builtin.file:
+        path: /usr/local/bin/node_exporter
+        state: absent
+      tags: [node_exporter]
+
+    - name: Create node_exporter symlink
+      ansible.builtin.file:
+        src: "/opt/node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter"
+        dest: /usr/local/bin/node_exporter
+        state: link
+        force: true
+      tags: [node_exporter]
+
+    - name: Create node_exporter systemd service
+      ansible.builtin.copy:
+        content: |
+          [Unit]
+          Description=Node Exporter
+          After=network.target
+
+          [Service]
+          User=prometheus
+          ExecStart=/usr/local/bin/node_exporter \
+            --web.listen-address=:{{ node_exporter_port }} \
+            --collector.systemd \
+            --collector.processes
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/node_exporter.service
+        mode: '0644'
+      notify:
+        - Reload systemd
+        - Restart node_exporter
+      tags: [node_exporter]
+
+    - name: Allow node_exporter port through UFW (VPN only)
+      community.general.ufw:
+        rule: allow
+        port: "{{ node_exporter_port }}"
+        proto: tcp
+        from_ip: "{{ vpn_network }}"
+      when: ufw_enabled | default(true)
+      tags: [node_exporter, firewall]
+
+    - name: Enable and start node_exporter
+      ansible.builtin.service:
+        name: node_exporter
+        state: started
+        enabled: true
+      tags: [node_exporter]
+
+    # =========================================================================
+    # XAI Metrics Exporter - Custom chain metrics
+    # =========================================================================
+    - name: Deploy XAI metrics exporter script
+      ansible.builtin.template:
+        src: templates/xai-metrics-exporter.py.j2
+        dest: /usr/local/bin/xai-metrics-exporter.py
+        mode: '0755'
+      when: node_type in ['validator', 'node']
+      notify: Restart xai_metrics
+      tags: [xai_metrics]
+
+    - name: Create xai-metrics systemd service
+      ansible.builtin.copy:
+        content: |
+          [Unit]
+          Description=XAI Prometheus Metrics Exporter
+          After=network.target {{ service_name }}.service
+
+          [Service]
+          User=prometheus
+          Environment=PATH={{ venv_path }}/bin:/usr/bin
+          ExecStart={{ venv_path }}/bin/python /usr/local/bin/xai-metrics-exporter.py
+          Restart=on-failure
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/xai-metrics.service
+        mode: '0644'
+      when: node_type in ['validator', 'node']
+      notify:
+        - Reload systemd
+        - Restart xai_metrics
+      tags: [xai_metrics]
+
+    - name: Allow xai_metrics port through UFW (VPN only)
+      community.general.ufw:
+        rule: allow
+        port: "{{ xai_metrics_port }}"
+        proto: tcp
+        from_ip: "{{ vpn_network }}"
+      when: ufw_enabled | default(true) and node_type in ['validator', 'node']
+      tags: [xai_metrics, firewall]
+
+    - name: Enable and start xai-metrics
+      ansible.builtin.service:
+        name: xai-metrics
+        state: started
+        enabled: true
+      when: node_type in ['validator', 'node']
+      tags: [xai_metrics]
+
+    # =========================================================================
+    # XAI Monitor - Uptime monitoring with alerts
+    # =========================================================================
+    - name: Deploy XAI monitor script
+      ansible.builtin.template:
+        src: templates/xai-monitor.py.j2
+        dest: /usr/local/bin/xai-monitor.py
+        mode: '0755'
+      when: node_type in ['validator', 'node']
+      notify: Restart xai_monitor
+      tags: [xai_monitor]
+
+    - name: Create xai-monitor systemd service
+      ansible.builtin.copy:
+        content: |
+          [Unit]
+          Description=XAI Node Monitor (alerts)
+          After=network.target {{ service_name }}.service
+
+          [Service]
+          User={{ daemon_user }}
+          Environment=PATH={{ venv_path }}/bin:/usr/bin
+          ExecStart={{ venv_path }}/bin/python /usr/local/bin/xai-monitor.py
+          Restart=on-failure
+          RestartSec=30
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/xai-monitor.service
+        mode: '0644'
+      when: node_type in ['validator', 'node']
+      notify:
+        - Reload systemd
+        - Restart xai_monitor
+      tags: [xai_monitor]
+
+    - name: Enable and start xai-monitor
+      ansible.builtin.service:
+        name: xai-monitor
+        state: started
+        enabled: true
+      when: node_type in ['validator', 'node']
+      tags: [xai_monitor]
+
+    # =========================================================================
+    # Verification
+    # =========================================================================
+    - name: Verify monitoring services
+      ansible.builtin.service_facts:
+      tags: [verify]
+
+    - name: Display monitoring status
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          XAI Monitoring Status: {{ inventory_hostname }}
+          ============================================
+          Node Exporter: {{ ansible_facts.services['node_exporter.service'].state | default('not installed') }}
+          {% if node_type in ['validator', 'node'] %}
+          XAI Metrics: {{ ansible_facts.services['xai-metrics.service'].state | default('not installed') }}
+          XAI Monitor: {{ ansible_facts.services['xai-monitor.service'].state | default('not installed') }}
+          {% endif %}
+          ============================================
+
+          Endpoints:
+            - Node Exporter: http://127.0.0.1:{{ node_exporter_port }}/metrics
+          {% if node_type in ['validator', 'node'] %}
+            - XAI Metrics: http://127.0.0.1:{{ xai_metrics_port }}/metrics
+          {% endif %}
+          ============================================
+      tags: [verify]

@@ -1,0 +1,33 @@
+# XAI Ansible Lint Configuration
+# This file marks the ansible directory as the project root for ansible-lint
+
+# Profile to use (safety, shared, moderate, production, etc.)
+profile: production
+
+# Offline mode - don't make network requests
+offline: true
+
+# Skip rules that can't be applied (e.g., templated hosts in migrate playbook)
+# Note: syntax-check is unskippable, but the migrate playbook uses templated hosts
+# which is expected behavior for migration playbooks
+
+# Exclude patterns
+exclude_paths:
+  - .cache/
+  - playbooks/  # Legacy playbooks, may not meet current standards
+  - support_migrate_node.yml  # Uses templated hosts ({{ source_host }}, {{ target_host }}) - validate with: ansible-playbook --syntax-check -e source_host=x -e target_host=y
+
+# Mock roles/collections that aren't installed
+mock_roles:
+  - xai_node
+  - common
+  - monitoring
+  - nginx
+
+# Use default rules
+use_default_rules: true
+
+# Enable all warnings
+enable_list:
+  - no-changed-when
+  - command-instead-of-module

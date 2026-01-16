@@ -1,0 +1,116 @@
+---
+# =============================================================================
+# XAI Global Variables
+# =============================================================================
+# Shared configuration for all XAI testnet nodes.
+# Per-node overrides go in host_vars/<hostname>.yml
+
+# =============================================================================
+# Chain Configuration
+# =============================================================================
+chain_name: "XAI"
+chain_id: "xai-mvp-testnet-1"
+daemon_name: "xai"
+daemon_user: "ubuntu"
+
+# =============================================================================
+# Python / Node Configuration
+# =============================================================================
+python_version: "3.12"
+venv_path: "/home/{{ daemon_user }}/xai/venv"
+xai_src: "/home/{{ daemon_user }}/xai"
+xai_home: "/home/{{ daemon_user }}/xai"
+xai_mvp_home: "/home/{{ daemon_user }}/xai-mvp"
+
+# =============================================================================
+# Network / Endpoints
+# =============================================================================
+artifacts_base_url: "https://artifacts.xaiblockchain.com"
+public_rpc: "testnet-rpc.xaiblockchain.com"
+public_api: "testnet-api.xaiblockchain.com"
+public_ws: "testnet-ws.xaiblockchain.com"
+
+# VPN network for private validator communication
+vpn_network: "10.10.0.0/24"
+
+# =============================================================================
+# System Configuration
+# =============================================================================
+timezone: UTC
+locale: en_US.UTF-8
+
+# SSH hardening
+ssh_port: 22
+ssh_permit_root: "yes"
+ssh_password_auth: "no"
+
+# Firewall defaults
+ufw_enabled: false  # Managed at server level
+ufw_default_incoming: deny
+ufw_default_outgoing: allow
+
+# =============================================================================
+# Common Packages
+# =============================================================================
+common_packages:
+  - curl
+  - wget
+  - vim
+  - htop
+  - jq
+  - git
+  - make
+  - build-essential
+  - unzip
+  - lz4
+  - tmux
+  - fail2ban
+  - ufw
+  - logrotate
+  - ca-certificates
+  - gnupg
+  - apt-transport-https
+  # Python-specific
+  - python3
+  - python3-pip
+  - python3-venv
+  - python3-dev
+  - libffi-dev
+  - libssl-dev
+
+# =============================================================================
+# Monitoring Ports
+# =============================================================================
+node_exporter_port: 9100
+node_exporter_version: "1.7.0"
+xai_metrics_port: 9302
+prometheus_scrape_interval: 15s
+
+# =============================================================================
+# Nginx (for sentries)
+# =============================================================================
+nginx_worker_processes: auto
+nginx_worker_connections: 4096
+
+# =============================================================================
+# Backup / Snapshot Settings
+# =============================================================================
+backup_retention_days: 7
+snapshot_retention: 3
+snapshot_dir: "/home/{{ daemon_user }}/xai-snapshots"
+
+# =============================================================================
+# XAI Environment Variables
+# =============================================================================
+# These are set in the systemd service
+xai_env:
+  XAI_CHAIN_ID: "{{ chain_id }}"
+  XAI_FAST_MINING: "1"
+  XAI_ALLOW_EMPTY_MINING: "true"
+  XAI_FINALITY_ENABLED: "true"
+
+# =============================================================================
+# Maintenance
+# =============================================================================
+maintenance_reminder_day: 1
+security_update_check: weekly

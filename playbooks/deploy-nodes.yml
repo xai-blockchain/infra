@@ -1,0 +1,16 @@
+---
+# Deploy XAI nodes
+# Usage:
+#   All nodes: ansible-playbook -i inventory/testnet.yml playbooks/deploy-nodes.yml
+#   Primary only:   ansible-playbook -i inventory/testnet.yml playbooks/deploy-nodes.yml --limit primary_nodes
+#   Single node:    ansible-playbook -i inventory/testnet.yml playbooks/deploy-nodes.yml --limit xai_node1
+
+- name: Deploy XAI nodes
+  hosts: nodes
+  become: yes
+  roles:
+    - common
+    - role: xai-node
+      tags: [node]
+    - role: monitoring
+      tags: [monitoring]

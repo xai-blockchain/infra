@@ -1,0 +1,51 @@
+---
+# XAI Node Setup - Primary deployment playbook
+#
+# Installs and configures XAI blockchain nodes with all dependencies.
+#
+# Usage:
+#   ansible-playbook -i inventory/testnet.yml main.yml
+#   ansible-playbook -i inventory/testnet.yml main.yml --limit xai_node1
+#   ansible-playbook -i inventory/testnet.yml main.yml --tags xai_node
+
+- name: XAI Node Deployment
+  hosts: all
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Verify required variables
+      ansible.builtin.assert:
+        that:
+          - node_name is defined
+          - rpc_port is defined
+          - daemon_home is defined
+        fail_msg: "Required variables not defined. Check inventory."
+      tags: [always]
+
+  roles:
+    - role: common
+      tags: [common, setup]
+
+    - role: xai_node
+      tags: [xai_node, node]
+
+  post_tasks:
+    - name: Display deployment summary
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          XAI Node Deployed: {{ node_name }}
+          ============================================
+          Host: {{ inventory_hostname }}
+          RPC Port: {{ rpc_port }}
+          P2P Port: {{ p2p_port }}
+          Service: {{ service_name }}
+          Data Dir: {{ daemon_home }}
+          ============================================
+
+          Next steps:
+            - Check status: curl http://127.0.0.1:{{ rpc_port }}/stats
+            - View logs: journalctl -u {{ service_name }} -f
+          ============================================
+      tags: [always]

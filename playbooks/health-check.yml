@@ -1,0 +1,59 @@
+---
+# XAI testnet health check
+# Usage: ansible-playbook -i inventory/testnet.yml playbooks/health-check.yml
+
+- name: Check XAI node health
+  hosts: nodes
+  gather_facts: yes
+  tasks:
+    - name: Check system uptime
+      ansible.builtin.command: uptime
+      register: uptime_output
+      changed_when: false
+
+    - name: Check disk usage
+      ansible.builtin.command: df -h /
+      register: disk_output
+      changed_when: false
+
+    - name: Check node process
+      ansible.builtin.shell: "pgrep -f 'python.*xai.core.node.*--port {{ rpc_port }}'"
+      register: process_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Check RPC endpoint
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ rpc_port }}/stats"
+        return_content: yes
+      register: rpc_status
+      ignore_errors: yes
+
+    - name: Parse chain height
+      ansible.builtin.set_fact:
+        chain_height: "{{ (rpc_status.json.chain_height | default('N/A')) }}"
+      when: rpc_status.status == 200
+
+    - name: Display node status
+      ansible.builtin.debug:
+        msg: |
+          === {{ node_name }} ({{ inventory_hostname }}) ===
+          Process: {{ 'Running' if process_check.rc == 0 else 'NOT RUNNING' }}
+          RPC: {{ 'OK' if rpc_status.status == 200 else 'FAILED' }}
+          Chain Height: {{ chain_height | default('N/A') }}
+          Mining: {{ mining | default(false) }}
+          Uptime: {{ uptime_output.stdout }}
+          Disk: {{ disk_output.stdout_lines[-1] }}
+
+- name: Check XAI services health
+  hosts: services
+  gather_facts: no
+  tasks:
+    - name: Check nginx
+      ansible.builtin.service_facts:
+
+    - name: Display service status
+      ansible.builtin.debug:
+        msg: |
+          === Services on {{ inventory_hostname }} ===
+          nginx: {{ ansible_facts.services['nginx.service'].state | default('not found') }}

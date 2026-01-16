@@ -1,0 +1,413 @@
+---
+# XAI Node Removal Playbook
+#
+# Cleanly removes an XAI node including all associated files and services.
+# Follows Polkachu cosmos-validators pattern for comprehensive cleanup.
+#
+# Usage:
+#   # Remove node with confirmation prompt
+#   ansible-playbook -i inventory/testnet.yml support_remove_node.yml --limit xai_node1
+#
+#   # Skip confirmation (for automation)
+#   ansible-playbook -i inventory/testnet.yml support_remove_node.yml --limit xai_node1 \
+#     -e confirm_removal=yes
+#
+#   # Archive data instead of delete
+#   ansible-playbook -i inventory/testnet.yml support_remove_node.yml --limit xai_node1 \
+#     -e archive_data=true -e confirm_removal=yes
+#
+#   # Keep keys (remove everything else)
+#   ansible-playbook -i inventory/testnet.yml support_remove_node.yml --limit xai_node1 \
+#     -e preserve_keys=true -e confirm_removal=yes
+#
+# What Gets Removed:
+#   - Systemd service (stopped, disabled, deleted)
+#   - Node data directory (blocks, state, indexes)
+#   - Configuration files
+#   - Log files and logrotate config
+#   - Firewall rules
+#   - Cron jobs (snapshots, monitoring)
+#   - Nginx upstream configs (if applicable)
+#   - Monitoring configs
+#
+# References:
+#   - https://github.com/polkachu/cosmos-validators (support_remove_node role)
+
+- name: XAI Node Removal
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    # Archive data instead of delete
+    archive_data: false
+    archive_dest: "/var/backups/xai-removed-nodes"
+    # Preserve keys during removal
+    preserve_keys: false
+    # Remove nginx configs
+    remove_nginx: true
+    # Remove monitoring configs
+    remove_monitoring: true
+    # Remove firewall rules
+    remove_firewall: true
+    # Remove cron jobs
+    remove_crons: true
+
+  tasks:
+    # =========================================================================
+    # Pre-flight Checks and Confirmation
+    # =========================================================================
+    - name: Verify required variables
+      ansible.builtin.assert:
+        that:
+          - node_name is defined
+          - daemon_home is defined
+          - service_name is defined
+        fail_msg: "Required variables node_name, daemon_home, and service_name must be defined"
+
+    - name: Display removal warning
+      ansible.builtin.debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════════╗
+          ║                        ⚠️  WARNING  ⚠️                            ║
+          ╠══════════════════════════════════════════════════════════════════╣
+          ║ You are about to REMOVE the following node:                      ║
+          ║                                                                  ║
+          ║   Node name: {{ node_name }}
+          ║   Host: {{ inventory_hostname }}
+          ║   Data directory: {{ daemon_home }}
+          ║   Service: {{ service_name }}
+          ║                                                                  ║
+          ║ This will:                                                       ║
+          ║   • Stop and remove the systemd service                          ║
+          ║   • {{ 'Archive' if archive_data else 'DELETE' }} all node data (blocks, state, indexes)
+          ║   • Remove configuration files                                   ║
+          ║   • Remove log files and logrotate config                        ║
+          ║   • {{ 'PRESERVE' if preserve_keys else 'REMOVE' }} node identity keys
+          ╚══════════════════════════════════════════════════════════════════╝
+
+    - name: Prompt for confirmation
+      ansible.builtin.pause:
+        prompt: "Type 'yes' to confirm removal of {{ node_name }}"
+      register: removal_confirmation
+      when: confirm_removal is not defined or confirm_removal != 'yes'
+
+    - name: Verify confirmation
+      ansible.builtin.fail:
+        msg: "Removal cancelled - confirmation not received"
+      when:
+        - confirm_removal is not defined or confirm_removal != 'yes'
+        - removal_confirmation.user_input != 'yes'
+
+    # =========================================================================
+    # Stop and Disable Service
+    # =========================================================================
+    - name: Check if service file exists
+      ansible.builtin.stat:
+        path: "/etc/systemd/system/{{ service_name }}.service"
+      register: service_file
+
+    - name: Stop node service
+      ansible.builtin.systemd:
+        name: "{{ service_name }}"
+        state: stopped
+      when: service_file.stat.exists
+      failed_when: false
+
+    - name: Disable node service
+      ansible.builtin.systemd:
+        name: "{{ service_name }}"
+        enabled: false
+      when: service_file.stat.exists
+      failed_when: false
+
+    - name: Wait for service to stop
+      ansible.builtin.wait_for:
+        timeout: 15
+
+    # =========================================================================
+    # Backup Keys (if preserving)
+    # =========================================================================
+    - name: Check for node identity
+      ansible.builtin.stat:
+        path: "{{ daemon_home }}/data/node_identity.json"
+      register: identity_exists
+
+    - name: Preserve node identity to temp location
+      ansible.builtin.copy:
+        src: "{{ daemon_home }}/data/node_identity.json"
+        dest: "/tmp/{{ node_name }}-preserved-identity.json"
+        remote_src: true
+        mode: '0600'
+      when:
+        - preserve_keys | bool
+        - identity_exists.stat.exists
+
+    - name: Check for wallets directory
+      ansible.builtin.stat:
+        path: "{{ daemon_home }}/wallets"
+      register: wallets_exists
+
+    - name: Preserve wallets to temp location
+      ansible.builtin.command:
+        cmd: cp -r {{ daemon_home }}/wallets /tmp/{{ node_name }}-preserved-wallets
+      when:
+        - preserve_keys | bool
+        - wallets_exists.stat.exists
+      changed_when: true
+
+    # =========================================================================
+    # Archive Data (if requested)
+    # =========================================================================
+    - name: Create archive directory
+      ansible.builtin.file:
+        path: "{{ archive_dest }}"
+        state: directory
+        mode: '0700'
+      when: archive_data | bool
+
+    - name: Archive node data
+      community.general.archive:
+        path: "{{ daemon_home }}"
+        dest: "{{ archive_dest }}/{{ node_name }}-{{ ansible_date_time.date }}.tar.gz"
+        format: gz
+        mode: '0600'
+      when: archive_data | bool
+      register: archive_result
+
+    - name: Display archive location
+      ansible.builtin.debug:
+        msg: "Node data archived to: {{ archive_dest }}/{{ node_name }}-{{ ansible_date_time.date }}.tar.gz"
+      when:
+        - archive_data | bool
+        - archive_result is succeeded
+
+    # =========================================================================
+    # Remove Node Data
+    # =========================================================================
+    - name: Remove node data directory
+      ansible.builtin.file:
+        path: "{{ daemon_home }}"
+        state: absent
+
+    # =========================================================================
+    # Remove Systemd Service
+    # =========================================================================
+    - name: Remove systemd service file
+      ansible.builtin.file:
+        path: "/etc/systemd/system/{{ service_name }}.service"
+        state: absent
+      notify: Reload systemd
+
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    # =========================================================================
+    # Remove Logrotate Config
+    # =========================================================================
+    - name: Remove logrotate configuration
+      ansible.builtin.file:
+        path: "/etc/logrotate.d/xai-{{ node_name }}"
+        state: absent
+
+    # =========================================================================
+    # Remove Firewall Rules
+    # =========================================================================
+    - name: Remove RPC port firewall rule
+      community.general.ufw:
+        rule: allow
+        port: "{{ rpc_port }}"
+        proto: tcp
+        delete: true
+      when:
+        - remove_firewall | bool
+        - rpc_port is defined
+      failed_when: false
+
+    - name: Remove P2P port firewall rule
+      community.general.ufw:
+        rule: allow
+        port: "{{ p2p_port }}"
+        proto: tcp
+        delete: true
+      when:
+        - remove_firewall | bool
+        - p2p_port is defined
+      failed_when: false
+
+    - name: Remove VPN-restricted RPC firewall rule
+      community.general.ufw:
+        rule: allow
+        port: "{{ rpc_port }}"
+        proto: tcp
+        from_ip: "{{ xai_node_vpn_network | default('10.10.0.0/24') }}"
+        delete: true
+      when:
+        - remove_firewall | bool
+        - rpc_port is defined
+      failed_when: false
+
+    # =========================================================================
+    # Remove Cron Jobs
+    # =========================================================================
+    - name: Remove snapshot cron job
+      ansible.builtin.cron:
+        name: "XAI snapshot {{ node_name }}"
+        state: absent
+      when: remove_crons | bool
+      failed_when: false
+
+    - name: Remove resync cron job
+      ansible.builtin.cron:
+        name: "XAI resync {{ node_name }}"
+        state: absent
+      when: remove_crons | bool
+      failed_when: false
+
+    - name: Remove monitoring cron job
+      ansible.builtin.cron:
+        name: "XAI health check {{ node_name }}"
+        state: absent
+      when: remove_crons | bool
+      failed_when: false
+
+    # =========================================================================
+    # Remove Nginx Configs
+    # =========================================================================
+    - name: Check for nginx upstream config
+      ansible.builtin.stat:
+        path: "/etc/nginx/conf.d/ansible-xai-{{ node_name }}-upstream.conf"
+      register: nginx_upstream
+      when: remove_nginx | bool
+
+    - name: Remove nginx upstream config
+      ansible.builtin.file:
+        path: "/etc/nginx/conf.d/ansible-xai-{{ node_name }}-upstream.conf"
+        state: absent
+      when:
+        - remove_nginx | bool
+        - nginx_upstream.stat.exists | default(false)
+      notify: Reload nginx
+
+    - name: Check for nginx site config
+      ansible.builtin.stat:
+        path: "/etc/nginx/sites-enabled/xai-{{ node_name }}.conf"
+      register: nginx_site
+      when: remove_nginx | bool
+
+    - name: Remove nginx site config (enabled)
+      ansible.builtin.file:
+        path: "/etc/nginx/sites-enabled/xai-{{ node_name }}.conf"
+        state: absent
+      when:
+        - remove_nginx | bool
+        - nginx_site.stat.exists | default(false)
+
+    - name: Remove nginx site config (available)
+      ansible.builtin.file:
+        path: "/etc/nginx/sites-available/xai-{{ node_name }}.conf"
+        state: absent
+      when: remove_nginx | bool
+
+    # =========================================================================
+    # Remove Monitoring Configs
+    # =========================================================================
+    - name: Remove node-specific monitoring script
+      ansible.builtin.file:
+        path: "/usr/local/bin/xai-{{ node_name }}-monitor.sh"
+        state: absent
+      when: remove_monitoring | bool
+
+    - name: Remove metrics exporter service
+      ansible.builtin.file:
+        path: "/etc/systemd/system/xai-{{ node_name }}-metrics.service"
+        state: absent
+      when: remove_monitoring | bool
+      notify: Reload systemd
+
+    # =========================================================================
+    # Restore Preserved Keys (if applicable)
+    # =========================================================================
+    - name: Create directory for preserved keys
+      ansible.builtin.file:
+        path: "/home/{{ daemon_user }}/preserved-keys/{{ node_name }}"
+        state: directory
+        owner: "{{ daemon_user }}"
+        group: "{{ daemon_user }}"
+        mode: '0700'
+      when: preserve_keys | bool
+
+    - name: Move preserved identity to safe location
+      ansible.builtin.command:
+        cmd: >
+          mv /tmp/{{ node_name }}-preserved-identity.json
+          /home/{{ daemon_user }}/preserved-keys/{{ node_name }}/node_identity.json
+      when:
+        - preserve_keys | bool
+        - identity_exists.stat.exists
+      changed_when: true
+      failed_when: false
+
+    - name: Move preserved wallets to safe location
+      ansible.builtin.command:
+        cmd: >
+          mv /tmp/{{ node_name }}-preserved-wallets
+          /home/{{ daemon_user }}/preserved-keys/{{ node_name }}/wallets
+      when:
+        - preserve_keys | bool
+        - wallets_exists.stat.exists
+      changed_when: true
+      failed_when: false
+
+    - name: Set preserved keys ownership
+      ansible.builtin.file:
+        path: "/home/{{ daemon_user }}/preserved-keys/{{ node_name }}"
+        owner: "{{ daemon_user }}"
+        group: "{{ daemon_user }}"
+        recurse: true
+        mode: '0700'
+      when: preserve_keys | bool
+
+    # =========================================================================
+    # Handlers
+    # =========================================================================
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Reload nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded
+      failed_when: false
+
+  post_tasks:
+    # =========================================================================
+    # Summary
+    # =========================================================================
+    - name: Display removal summary
+      ansible.builtin.debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════════╗
+          ║                    XAI NODE REMOVAL COMPLETE                     ║
+          ╠══════════════════════════════════════════════════════════════════╣
+          ║ Node: {{ node_name }}
+          ║ Host: {{ inventory_hostname }}
+          ║ Service: REMOVED
+          ║ Data: {{ 'ARCHIVED to ' ~ archive_dest if archive_data else 'DELETED' }}
+          ║ Keys: {{ 'PRESERVED at /home/' ~ daemon_user ~ '/preserved-keys/' ~ node_name if preserve_keys else 'REMOVED' }}
+          ║ Firewall: {{ 'CLEANED' if remove_firewall else 'UNCHANGED' }}
+          ║ Crons: {{ 'REMOVED' if remove_crons else 'UNCHANGED' }}
+          ║ Nginx: {{ 'CLEANED' if remove_nginx else 'UNCHANGED' }}
+          ╠══════════════════════════════════════════════════════════════════╣
+          ║ NEXT STEPS:                                                      ║
+          ║ 1. Update inventory to remove {{ node_name }}
+          ║ 2. Update peer lists on other nodes                              ║
+          ║ 3. Update monitoring/alerting configs                            ║
+          {% if preserve_keys %}
+          ║ 4. Secure preserved keys at:                                     ║
+          ║    /home/{{ daemon_user }}/preserved-keys/{{ node_name }}/
+          {% endif %}
+          ╚══════════════════════════════════════════════════════════════════╝

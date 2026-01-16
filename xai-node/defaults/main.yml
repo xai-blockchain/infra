@@ -1,0 +1,15 @@
+---
+# Default variables for xai-node role
+
+chain: xai
+chain_id: xai-mvp-testnet-1
+daemon_name: xai
+daemon_user: xai
+daemon_home: /home/xai/xai
+venv_path: "{{ daemon_home }}/venv"
+
+rpc_port: 8545
+p2p_port: 8333
+ws_port: 8765
+
+service_name: xai
