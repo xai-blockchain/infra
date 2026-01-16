@@ -32,12 +32,13 @@
         return_content: true
       register: current_status
       failed_when: false
+      check_mode: false  # Read-only, safe to run in check mode
 
     - name: Set current height fact
       ansible.builtin.set_fact:
         current_height: "{{ (current_status.content | from_json).chain_height | default(0) }}"
         current_peers: "{{ (current_status.content | from_json).peers | default(0) }}"
-      when: current_status is succeeded
+      when: current_status is succeeded and current_status.content is defined
 
     - name: Get network height from sentry
       ansible.builtin.uri:
@@ -47,11 +48,12 @@
       failed_when: false
       delegate_to: localhost
       become: false
+      check_mode: false  # Read-only, safe to run in check mode
 
     - name: Set network height fact
       ansible.builtin.set_fact:
         network_height: "{{ (network_status.content | from_json).chain_height | default(0) }}"
-      when: network_status is succeeded
+      when: network_status is succeeded and network_status.content is defined
 
     - name: Calculate sync lag
       ansible.builtin.set_fact:
@@ -89,12 +91,13 @@
         return_content: true
       register: snapshot_info
       failed_when: false
+      check_mode: false  # Read-only, safe to run in check mode
 
     - name: Set snapshot facts
       ansible.builtin.set_fact:
         snapshot_url: "{{ (snapshot_info.content | from_json).url }}"
         snapshot_height: "{{ (snapshot_info.content | from_json).height }}"
-      when: snapshot_info is succeeded
+      when: snapshot_info is succeeded and snapshot_info.content is defined
 
     - name: Decide sync method
       ansible.builtin.debug:
@@ -176,6 +179,7 @@
       until: final_status.status == 200
       retries: 30
       delay: 2
+      check_mode: false  # Read-only, safe to run in check mode
 
     - name: Display sync result
       ansible.builtin.debug:
@@ -186,6 +190,7 @@
           Peers: {{ (final_status.content | from_json).peers }}
 
           Node will continue syncing from peers to reach network height.
+      when: final_status.content is defined
 
     - name: Clean up old backups (keep last 2)
       ansible.builtin.shell: |

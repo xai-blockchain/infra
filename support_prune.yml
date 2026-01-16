@@ -1,0 +1,373 @@
+---
+# XAI Data Pruning - Disk space management
+#
+# Manages disk space by pruning old blockchain data, logs, and temporary files.
+# Standard blockchain community pattern for node maintenance.
+#
+# Usage:
+#   ansible-playbook -i inventory/testnet.yml support_prune.yml --limit xai_node1
+#   ansible-playbook -i inventory/testnet.yml support_prune.yml -e prune_mode=aggressive
+#   ansible-playbook -i inventory/testnet.yml support_prune.yml -e dry_run=true
+#
+# Variables:
+#   prune_mode: 'normal', 'aggressive', 'logs_only' (default: normal)
+#   dry_run: Show what would be pruned without deleting (default: false)
+#   keep_blocks: Number of recent blocks to keep (default: 100000)
+#   log_retention_days: Days of logs to keep (default: 7)
+
+- name: XAI Data Pruning
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    prune_mode: "normal"
+    dry_run: false
+    keep_blocks: 100000
+    log_retention_days: 7
+    snapshot_retention: 3
+    backup_retention_days: 14
+    temp_file_age_hours: 24
+
+  tasks:
+    # =========================================================================
+    # Pre-Prune Analysis
+    # =========================================================================
+    - name: Check current disk usage
+      ansible.builtin.command:
+        cmd: df -h {{ daemon_home }}
+      register: disk_usage_before
+      changed_when: false
+
+    - name: Get data directory size
+      ansible.builtin.command:
+        cmd: du -sh {{ daemon_home }}/data
+      register: data_dir_size
+      changed_when: false
+      failed_when: false
+
+    - name: Get log directory size
+      ansible.builtin.command:
+        cmd: du -sh {{ daemon_home }}/logs
+      register: log_dir_size
+      changed_when: false
+      failed_when: false
+
+    - name: Display pre-prune status
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          Pre-Prune Analysis: {{ inventory_hostname }}
+          ============================================
+          Prune Mode: {{ prune_mode }}
+          Dry Run: {{ dry_run }}
+          ============================================
+
+          Disk Usage:
+          {{ disk_usage_before.stdout }}
+
+          Directory Sizes:
+            Data: {{ data_dir_size.stdout | default('N/A') }}
+            Logs: {{ log_dir_size.stdout | default('N/A') }}
+
+          Retention Settings:
+            Keep blocks: {{ keep_blocks }}
+            Log retention: {{ log_retention_days }} days
+            Snapshot retention: {{ snapshot_retention }}
+            Backup retention: {{ backup_retention_days }} days
+          ============================================
+
+    # =========================================================================
+    # Log Pruning (all modes)
+    # =========================================================================
+    - name: Find old log files
+      ansible.builtin.find:
+        paths:
+          - "{{ daemon_home }}/logs"
+          - /var/log/xai
+        patterns:
+          - "*.log"
+          - "*.log.*"
+          - "*.gz"
+        age: "{{ log_retention_days }}d"
+        recurse: true
+      register: old_logs
+
+    - name: Display logs to prune (dry run)
+      ansible.builtin.debug:
+        msg: "Would delete {{ old_logs.matched }} log files"
+      when: dry_run | bool and old_logs.matched > 0
+
+    - name: Delete old log files
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old_logs.files }}"
+      when: not dry_run | bool and old_logs.matched > 0
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Truncate active log files
+      ansible.builtin.shell: |
+        set -o pipefail
+        for log in {{ daemon_home }}/logs/*.log; do
+          if [ -f "$log" ] && [ $(stat -c%s "$log" 2>/dev/null || echo 0) -gt 104857600 ]; then
+            echo "Truncating $log"
+            {% if not dry_run %}
+            tail -c 10485760 "$log" > "$log.tmp" && mv "$log.tmp" "$log"
+            {% else %}
+            echo "(dry run - would truncate)"
+            {% endif %}
+          fi
+        done
+      args:
+        executable: /bin/bash
+      register: truncate_result
+      changed_when: "'Truncating' in truncate_result.stdout"
+      when: prune_mode in ['normal', 'aggressive']
+
+    # =========================================================================
+    # Snapshot Pruning (normal and aggressive modes)
+    # =========================================================================
+    - name: Find old snapshots
+      ansible.builtin.find:
+        paths: "/home/{{ daemon_user }}/xai-snapshots"
+        patterns: "*.tar.lz4"
+        age: "7d"
+      register: old_snapshots
+      when: prune_mode in ['normal', 'aggressive']
+      failed_when: false
+
+    - name: Keep only recent snapshots
+      ansible.builtin.shell: |
+        set -o pipefail
+        SNAPSHOT_DIR="/home/{{ daemon_user }}/xai-snapshots"
+        if [ -d "$SNAPSHOT_DIR" ]; then
+          {% if dry_run %}
+          echo "Would keep {{ snapshot_retention }} snapshots, delete:"
+          ls -t "$SNAPSHOT_DIR"/*.tar.lz4 2>/dev/null | tail -n +{{ snapshot_retention + 1 }} || true
+          {% else %}
+          ls -t "$SNAPSHOT_DIR"/*.tar.lz4 2>/dev/null | tail -n +{{ snapshot_retention + 1 }} | xargs -r rm -f || true
+          echo "Cleaned old snapshots"
+          {% endif %}
+        fi
+      args:
+        executable: /bin/bash
+      register: snapshot_cleanup
+      changed_when: "'Cleaned' in snapshot_cleanup.stdout or 'Would' in snapshot_cleanup.stdout"
+      when: prune_mode in ['normal', 'aggressive']
+
+    # =========================================================================
+    # Backup Pruning (normal and aggressive modes)
+    # =========================================================================
+    - name: Find old backups
+      ansible.builtin.find:
+        paths: "/home/{{ daemon_user }}/xai-backups"
+        patterns:
+          - "*.tar.gz"
+          - "*.gpg"
+        age: "{{ backup_retention_days }}d"
+      register: old_backups
+      when: prune_mode in ['normal', 'aggressive']
+      failed_when: false
+
+    - name: Display backups to prune (dry run)
+      ansible.builtin.debug:
+        msg: "Would delete {{ old_backups.matched }} backup files"
+      when: dry_run | bool and old_backups.matched | default(0) > 0
+
+    - name: Delete old backup files
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old_backups.files | default([]) }}"
+      when: not dry_run | bool and old_backups.matched | default(0) > 0
+      loop_control:
+        label: "{{ item.path }}"
+
+    # =========================================================================
+    # Temporary File Cleanup (all modes)
+    # =========================================================================
+    - name: Find temporary files
+      ansible.builtin.find:
+        paths:
+          - /tmp
+          - /var/tmp
+        patterns:
+          - "xai-*"
+          - "xai_*"
+          - "*.tmp"
+        age: "{{ temp_file_age_hours }}h"
+      register: temp_files
+
+    - name: Display temp files to prune (dry run)
+      ansible.builtin.debug:
+        msg: "Would delete {{ temp_files.matched }} temporary files"
+      when: dry_run | bool and temp_files.matched > 0
+
+    - name: Delete temporary files
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ temp_files.files }}"
+      when: not dry_run | bool and temp_files.matched > 0
+      loop_control:
+        label: "{{ item.path }}"
+
+    # =========================================================================
+    # State Sync Backup Cleanup (aggressive mode)
+    # =========================================================================
+    - name: Find old state sync backups
+      ansible.builtin.find:
+        paths: "{{ daemon_home }}"
+        patterns: "data.statesync.*"
+        file_type: directory
+        age: "7d"
+      register: old_statesync
+      when: prune_mode == 'aggressive'
+
+    - name: Display state sync backups to prune (dry run)
+      ansible.builtin.debug:
+        msg: "Would delete {{ old_statesync.matched }} state sync backup directories"
+      when: dry_run | bool and old_statesync.matched | default(0) > 0 and prune_mode == 'aggressive'
+
+    - name: Delete old state sync backups
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old_statesync.files | default([]) }}"
+      when: not dry_run | bool and prune_mode == 'aggressive' and old_statesync.matched | default(0) > 0
+      loop_control:
+        label: "{{ item.path }}"
+
+    # =========================================================================
+    # Journal Cleanup (aggressive mode)
+    # =========================================================================
+    - name: Vacuum systemd journal
+      ansible.builtin.command:
+        cmd: journalctl --vacuum-time={{ log_retention_days }}d
+      register: journal_vacuum
+      changed_when: "'Vacuuming done' in journal_vacuum.stdout"
+      when: prune_mode == 'aggressive' and not dry_run | bool
+
+    - name: Display journal vacuum (dry run)
+      ansible.builtin.debug:
+        msg: "Would vacuum systemd journal older than {{ log_retention_days }} days"
+      when: dry_run | bool and prune_mode == 'aggressive'
+
+    # =========================================================================
+    # Docker Cleanup (aggressive mode)
+    # =========================================================================
+    - name: Clean Docker system
+      ansible.builtin.command:
+        cmd: docker system prune -f --volumes
+      register: docker_prune
+      changed_when: "'Total reclaimed space' in docker_prune.stdout"
+      when: prune_mode == 'aggressive' and not dry_run | bool
+      failed_when: false
+
+    - name: Display Docker cleanup (dry run)
+      ansible.builtin.debug:
+        msg: "Would run docker system prune"
+      when: dry_run | bool and prune_mode == 'aggressive'
+
+    # =========================================================================
+    # Post-Prune Analysis
+    # =========================================================================
+    - name: Check disk usage after prune
+      ansible.builtin.command:
+        cmd: df -h {{ daemon_home }}
+      register: disk_usage_after
+      changed_when: false
+      when: not dry_run | bool
+
+    - name: Get data directory size after prune
+      ansible.builtin.command:
+        cmd: du -sh {{ daemon_home }}/data
+      register: data_dir_size_after
+      changed_when: false
+      failed_when: false
+      when: not dry_run | bool
+
+    - name: Display prune summary
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          Prune Summary: {{ inventory_hostname }}
+          ============================================
+          Mode: {{ prune_mode }}
+          Dry Run: {{ dry_run }}
+          ============================================
+
+          {% if not dry_run %}
+          Disk Usage After:
+          {{ disk_usage_after.stdout }}
+
+          Data Directory: {{ data_dir_size_after.stdout | default('N/A') }}
+          {% endif %}
+
+          Actions Performed:
+            - Log files cleaned: {{ old_logs.matched | default(0) }}
+            - Snapshots cleaned: {{ snapshot_cleanup.changed | default(false) }}
+            - Backups cleaned: {{ old_backups.matched | default(0) }}
+            - Temp files cleaned: {{ temp_files.matched | default(0) }}
+          {% if prune_mode == 'aggressive' %}
+            - State sync backups: {{ old_statesync.matched | default(0) }}
+            - Journal vacuumed: {{ journal_vacuum.changed | default(false) }}
+            - Docker pruned: {{ docker_prune.changed | default(false) }}
+          {% endif %}
+          ============================================
+
+          {% if dry_run %}
+          NOTE: This was a dry run. No files were deleted.
+          Run without -e dry_run=true to perform actual cleanup.
+          {% endif %}
+          ============================================
+
+    # =========================================================================
+    # Setup Automated Pruning (optional)
+    # =========================================================================
+    - name: Deploy automated prune script
+      ansible.builtin.copy:
+        content: |
+          #!/bin/bash
+          # XAI Automated Pruning Script
+          # Auto-generated by Ansible
+
+          set -euo pipefail
+
+          LOG_RETENTION={{ log_retention_days }}
+          SNAPSHOT_RETENTION={{ snapshot_retention }}
+          DAEMON_HOME="{{ daemon_home }}"
+
+          echo "[$(date)] Starting XAI prune..."
+
+          # Clean old logs
+          find "$DAEMON_HOME/logs" -name "*.log.*" -mtime +$LOG_RETENTION -delete 2>/dev/null || true
+          find /var/log/xai -name "*.log.*" -mtime +$LOG_RETENTION -delete 2>/dev/null || true
+
+          # Clean old snapshots
+          SNAPSHOT_DIR="/home/{{ daemon_user }}/xai-snapshots"
+          if [ -d "$SNAPSHOT_DIR" ]; then
+            ls -t "$SNAPSHOT_DIR"/*.tar.lz4 2>/dev/null | tail -n +$((SNAPSHOT_RETENTION + 1)) | xargs -r rm -f
+          fi
+
+          # Clean temp files
+          find /tmp -name "xai-*" -mmin +1440 -delete 2>/dev/null || true
+
+          echo "[$(date)] XAI prune complete"
+        dest: /usr/local/bin/xai-prune.sh
+        owner: root
+        group: root
+        mode: '0755'
+      when: not dry_run | bool
+
+    - name: Setup weekly prune cron job
+      ansible.builtin.cron:
+        name: "XAI weekly prune"
+        minute: "0"
+        hour: "4"
+        weekday: "0"
+        job: "/usr/local/bin/xai-prune.sh >> /var/log/xai-prune.log 2>&1"
+        user: root
+      when: not dry_run | bool

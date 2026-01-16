@@ -1,0 +1,493 @@
+---
+# XAI Grafana Deployment - Metrics visualization and dashboards
+#
+# Deploys Grafana server with pre-configured XAI dashboards and Prometheus
+# data source. Standard blockchain community pattern for monitoring visualization.
+#
+# Usage:
+#   ansible-playbook -i inventory/testnet.yml support_grafana.yml --limit monitoring
+#   ansible-playbook -i inventory/testnet.yml support_grafana.yml -e grafana_password=SecurePass123
+#
+# Variables:
+#   grafana_version: Grafana version to install (default: latest)
+#   grafana_port: Grafana web port (default: 3000)
+#   grafana_password: Admin password (default: generated)
+#   prometheus_url: Prometheus server URL for data source
+
+- name: XAI Grafana Deployment
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    grafana_port: 3000
+    grafana_user: admin
+    grafana_password: "{{ lookup('password', '/dev/null length=16 chars=ascii_letters,digits') }}"
+    prometheus_url: "http://127.0.0.1:9090"
+    grafana_domain: "testnet-grafana.xaiblockchain.com"
+    vpn_network: "10.10.0.0/24"
+
+  handlers:
+    - name: Restart grafana
+      ansible.builtin.service:
+        name: grafana-server
+        state: restarted
+
+    - name: Reload grafana
+      ansible.builtin.service:
+        name: grafana-server
+        state: reloaded
+
+  tasks:
+    # =========================================================================
+    # Install Grafana
+    # =========================================================================
+    - name: Install prerequisite packages
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - software-properties-common
+          - wget
+          - gnupg
+        state: present
+        update_cache: true
+
+    - name: Add Grafana GPG key
+      ansible.builtin.apt_key:
+        url: https://apt.grafana.com/gpg.key
+        state: present
+
+    - name: Add Grafana repository
+      ansible.builtin.apt_repository:
+        repo: "deb https://apt.grafana.com stable main"
+        state: present
+        filename: grafana
+
+    - name: Install Grafana
+      ansible.builtin.apt:
+        name: grafana
+        state: present
+        update_cache: true
+      notify: Restart grafana
+
+    # =========================================================================
+    # Configure Grafana
+    # =========================================================================
+    - name: Configure Grafana server
+      community.general.ini_file:
+        path: /etc/grafana/grafana.ini
+        section: "{{ item.section }}"
+        option: "{{ item.option }}"
+        value: "{{ item.value }}"
+        mode: '0640'
+        owner: root
+        group: grafana
+      loop:
+        - { section: "server", option: "http_port", value: "{{ grafana_port }}" }
+        - { section: "server", option: "domain", value: "{{ grafana_domain }}" }
+        - { section: "server", option: "root_url", value: "https://{{ grafana_domain }}" }
+        - { section: "security", option: "admin_user", value: "{{ grafana_user }}" }
+        - { section: "security", option: "admin_password", value: "{{ grafana_password }}" }
+        - { section: "users", option: "allow_sign_up", value: "false" }
+        - { section: "auth.anonymous", option: "enabled", value: "true" }
+        - { section: "auth.anonymous", option: "org_role", value: "Viewer" }
+        - { section: "dashboards", option: "default_home_dashboard_path", value: "/var/lib/grafana/dashboards/xai-overview.json" }
+      notify: Restart grafana
+
+    # =========================================================================
+    # Provisioning - Data Sources
+    # =========================================================================
+    - name: Create provisioning directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: grafana
+        group: grafana
+        mode: '0755'
+      loop:
+        - /etc/grafana/provisioning/datasources
+        - /etc/grafana/provisioning/dashboards
+        - /var/lib/grafana/dashboards
+
+    - name: Configure Prometheus data source
+      ansible.builtin.copy:
+        content: |
+          apiVersion: 1
+          datasources:
+            - name: Prometheus
+              type: prometheus
+              access: proxy
+              url: {{ prometheus_url }}
+              isDefault: true
+              editable: false
+              jsonData:
+                timeInterval: "15s"
+                httpMethod: POST
+        dest: /etc/grafana/provisioning/datasources/prometheus.yml
+        owner: grafana
+        group: grafana
+        mode: '0640'
+      notify: Restart grafana
+
+    # =========================================================================
+    # Provisioning - Dashboard Provider
+    # =========================================================================
+    - name: Configure dashboard provider
+      ansible.builtin.copy:
+        content: |
+          apiVersion: 1
+          providers:
+            - name: 'XAI Dashboards'
+              orgId: 1
+              folder: 'XAI'
+              folderUid: 'xai'
+              type: file
+              disableDeletion: false
+              updateIntervalSeconds: 30
+              allowUiUpdates: true
+              options:
+                path: /var/lib/grafana/dashboards
+        dest: /etc/grafana/provisioning/dashboards/xai.yml
+        owner: grafana
+        group: grafana
+        mode: '0640'
+      notify: Restart grafana
+
+    # =========================================================================
+    # XAI Overview Dashboard
+    # =========================================================================
+    - name: Deploy XAI Overview dashboard
+      ansible.builtin.copy:
+        content: |
+          {
+            "annotations": { "list": [] },
+            "editable": true,
+            "fiscalYearStartMonth": 0,
+            "graphTooltip": 0,
+            "id": null,
+            "links": [],
+            "liveNow": false,
+            "panels": [
+              {
+                "datasource": { "type": "prometheus", "uid": "prometheus" },
+                "fieldConfig": {
+                  "defaults": {
+                    "color": { "mode": "palette-classic" },
+                    "mappings": [],
+                    "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}] },
+                    "unit": "short"
+                  },
+                  "overrides": []
+                },
+                "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+                "id": 1,
+                "options": {
+                  "colorMode": "value",
+                  "graphMode": "none",
+                  "justifyMode": "auto",
+                  "orientation": "auto",
+                  "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+                  "textMode": "auto"
+                },
+                "title": "Chain Height",
+                "type": "stat",
+                "targets": [{
+                  "expr": "xai_chain_height",
+                  "legendFormat": "Height",
+                  "refId": "A"
+                }]
+              },
+              {
+                "datasource": { "type": "prometheus", "uid": "prometheus" },
+                "fieldConfig": {
+                  "defaults": {
+                    "color": { "mode": "thresholds" },
+                    "mappings": [],
+                    "thresholds": {
+                      "mode": "absolute",
+                      "steps": [
+                        {"color": "red", "value": null},
+                        {"color": "yellow", "value": 1},
+                        {"color": "green", "value": 3}
+                      ]
+                    },
+                    "unit": "short"
+                  },
+                  "overrides": []
+                },
+                "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+                "id": 2,
+                "options": {
+                  "colorMode": "value",
+                  "graphMode": "none",
+                  "justifyMode": "auto",
+                  "orientation": "auto",
+                  "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+                  "textMode": "auto"
+                },
+                "title": "Connected Peers",
+                "type": "stat",
+                "targets": [{
+                  "expr": "xai_peer_count",
+                  "legendFormat": "Peers",
+                  "refId": "A"
+                }]
+              },
+              {
+                "datasource": { "type": "prometheus", "uid": "prometheus" },
+                "fieldConfig": {
+                  "defaults": {
+                    "color": { "mode": "thresholds" },
+                    "mappings": [
+                      {"options": {"0": {"color": "red", "index": 0, "text": "Stopped"}}, "type": "value"},
+                      {"options": {"1": {"color": "green", "index": 1, "text": "Mining"}}, "type": "value"}
+                    ],
+                    "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}] }
+                  },
+                  "overrides": []
+                },
+                "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+                "id": 3,
+                "options": {
+                  "colorMode": "background",
+                  "graphMode": "none",
+                  "justifyMode": "auto",
+                  "orientation": "auto",
+                  "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+                  "textMode": "auto"
+                },
+                "title": "Mining Status",
+                "type": "stat",
+                "targets": [{
+                  "expr": "xai_mining_active",
+                  "legendFormat": "Mining",
+                  "refId": "A"
+                }]
+              },
+              {
+                "datasource": { "type": "prometheus", "uid": "prometheus" },
+                "fieldConfig": {
+                  "defaults": {
+                    "color": { "mode": "palette-classic" },
+                    "custom": {
+                      "axisCenteredZero": false,
+                      "axisColorMode": "text",
+                      "axisLabel": "",
+                      "axisPlacement": "auto",
+                      "barAlignment": 0,
+                      "drawStyle": "line",
+                      "fillOpacity": 10,
+                      "gradientMode": "none",
+                      "lineWidth": 2,
+                      "pointSize": 5,
+                      "showPoints": "never",
+                      "spanNulls": false,
+                      "stacking": { "group": "A", "mode": "none" }
+                    },
+                    "mappings": [],
+                    "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}] },
+                    "unit": "short"
+                  },
+                  "overrides": []
+                },
+                "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+                "id": 4,
+                "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } },
+                "title": "Block Height Over Time",
+                "type": "timeseries",
+                "targets": [{
+                  "expr": "xai_chain_height",
+                  "legendFormat": "{% raw %}{{ instance }}{% endraw %}",
+                  "refId": "A"
+                }]
+              },
+              {
+                "datasource": { "type": "prometheus", "uid": "prometheus" },
+                "fieldConfig": {
+                  "defaults": {
+                    "color": { "mode": "palette-classic" },
+                    "custom": {
+                      "axisCenteredZero": false,
+                      "axisColorMode": "text",
+                      "axisLabel": "",
+                      "axisPlacement": "auto",
+                      "barAlignment": 0,
+                      "drawStyle": "line",
+                      "fillOpacity": 10,
+                      "gradientMode": "none",
+                      "lineWidth": 2,
+                      "pointSize": 5,
+                      "showPoints": "never",
+                      "spanNulls": false,
+                      "stacking": { "group": "A", "mode": "none" }
+                    },
+                    "mappings": [],
+                    "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}] },
+                    "unit": "percentunit"
+                  },
+                  "overrides": []
+                },
+                "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+                "id": 5,
+                "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } },
+                "title": "CPU Usage",
+                "type": "timeseries",
+                "targets": [{
+                  "expr": "1 - avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) by (instance)",
+                  "legendFormat": "{% raw %}{{ instance }}{% endraw %}",
+                  "refId": "A"
+                }]
+              },
+              {
+                "datasource": { "type": "prometheus", "uid": "prometheus" },
+                "fieldConfig": {
+                  "defaults": {
+                    "color": { "mode": "palette-classic" },
+                    "custom": {
+                      "axisCenteredZero": false,
+                      "axisColorMode": "text",
+                      "axisLabel": "",
+                      "axisPlacement": "auto",
+                      "barAlignment": 0,
+                      "drawStyle": "line",
+                      "fillOpacity": 10,
+                      "gradientMode": "none",
+                      "lineWidth": 2,
+                      "pointSize": 5,
+                      "showPoints": "never",
+                      "spanNulls": false,
+                      "stacking": { "group": "A", "mode": "none" }
+                    },
+                    "mappings": [],
+                    "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}] },
+                    "unit": "bytes"
+                  },
+                  "overrides": []
+                },
+                "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+                "id": 6,
+                "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } },
+                "title": "Memory Usage",
+                "type": "timeseries",
+                "targets": [{
+                  "expr": "node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes",
+                  "legendFormat": "{% raw %}{{ instance }}{% endraw %}",
+                  "refId": "A"
+                }]
+              },
+              {
+                "datasource": { "type": "prometheus", "uid": "prometheus" },
+                "fieldConfig": {
+                  "defaults": {
+                    "color": { "mode": "palette-classic" },
+                    "custom": {
+                      "axisCenteredZero": false,
+                      "axisColorMode": "text",
+                      "axisLabel": "",
+                      "axisPlacement": "auto",
+                      "barAlignment": 0,
+                      "drawStyle": "line",
+                      "fillOpacity": 10,
+                      "gradientMode": "none",
+                      "lineWidth": 2,
+                      "pointSize": 5,
+                      "showPoints": "never",
+                      "spanNulls": false,
+                      "stacking": { "group": "A", "mode": "none" }
+                    },
+                    "mappings": [],
+                    "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}] },
+                    "unit": "percentunit"
+                  },
+                  "overrides": []
+                },
+                "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+                "id": 7,
+                "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } },
+                "title": "Disk Usage",
+                "type": "timeseries",
+                "targets": [{
+                  "expr": "1 - (node_filesystem_avail_bytes{mountpoint=\"/\"} / node_filesystem_size_bytes{mountpoint=\"/\"})",
+                  "legendFormat": "{% raw %}{{ instance }}{% endraw %}",
+                  "refId": "A"
+                }]
+              }
+            ],
+            "refresh": "30s",
+            "schemaVersion": 38,
+            "style": "dark",
+            "tags": ["xai", "blockchain"],
+            "templating": { "list": [] },
+            "time": { "from": "now-1h", "to": "now" },
+            "timepicker": {},
+            "timezone": "browser",
+            "title": "XAI Overview",
+            "uid": "xai-overview",
+            "version": 1
+          }
+        dest: /var/lib/grafana/dashboards/xai-overview.json
+        owner: grafana
+        group: grafana
+        mode: '0644'
+      notify: Restart grafana
+
+    # =========================================================================
+    # Firewall Configuration
+    # =========================================================================
+    - name: Allow Grafana port through UFW (VPN only)
+      community.general.ufw:
+        rule: allow
+        port: "{{ grafana_port }}"
+        proto: tcp
+        from_ip: "{{ vpn_network }}"
+
+    # =========================================================================
+    # Enable and Start Grafana
+    # =========================================================================
+    - name: Enable and start Grafana
+      ansible.builtin.service:
+        name: grafana-server
+        state: started
+        enabled: true
+
+    # =========================================================================
+    # Verification
+    # =========================================================================
+    - name: Wait for Grafana to start
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ grafana_port }}/api/health"
+        status_code: 200
+      register: grafana_health
+      until: grafana_health.status == 200
+      retries: 30
+      delay: 2
+      check_mode: false
+
+    - name: Display Grafana configuration
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          XAI Grafana Deployed
+          ============================================
+          Server: {{ inventory_hostname }}
+          Port: {{ grafana_port }}
+          Domain: {{ grafana_domain }}
+          ============================================
+
+          Credentials:
+            Username: {{ grafana_user }}
+            Password: {{ grafana_password }}
+
+          Access:
+            Local: http://127.0.0.1:{{ grafana_port }}
+            Public: https://{{ grafana_domain }}
+
+          Data Sources:
+            - Prometheus: {{ prometheus_url }}
+
+          Dashboards:
+            - XAI Overview (default home)
+          ============================================
+
+          NOTE: Save the admin password securely!
+          ============================================

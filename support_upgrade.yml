@@ -1,0 +1,275 @@
+---
+# XAI Upgrade Playbook - Structured package and binary upgrades
+#
+# Handles XAI node upgrades with proper service management, backup,
+# and rollback capability. Standard blockchain community upgrade pattern.
+#
+# Usage:
+#   ansible-playbook -i inventory/testnet.yml support_upgrade.yml --limit xai_node1
+#   ansible-playbook -i inventory/testnet.yml support_upgrade.yml -e xai_version=1.2.0
+#   ansible-playbook -i inventory/testnet.yml support_upgrade.yml -e upgrade_mode=rolling
+#
+# Variables:
+#   xai_version: Target version to upgrade to (default: latest)
+#   upgrade_mode: 'parallel' (all at once) or 'rolling' (one by one)
+#   skip_backup: Skip pre-upgrade backup (default: false)
+#   force_upgrade: Upgrade even if already at target version (default: false)
+
+- name: XAI Node Upgrade
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    xai_version: "latest"
+    upgrade_mode: "parallel"
+    skip_backup: false
+    force_upgrade: false
+    backup_dir: "/home/{{ daemon_user }}/xai-backups"
+    rollback_on_failure: true
+
+  handlers:
+    - name: Restart xai service
+      ansible.builtin.service:
+        name: "{{ service_name }}"
+        state: restarted
+
+  tasks:
+    # =========================================================================
+    # Pre-Upgrade Checks
+    # =========================================================================
+    - name: Check current node status
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ rpc_port }}/stats"
+        return_content: true
+      register: pre_upgrade_status
+      failed_when: false
+      check_mode: false
+
+    - name: Set pre-upgrade facts
+      ansible.builtin.set_fact:
+        pre_upgrade_height: "{{ (pre_upgrade_status.content | from_json).chain_height | default(0) }}"
+        pre_upgrade_version: "{{ (pre_upgrade_status.content | from_json).version | default('unknown') }}"
+      when: pre_upgrade_status is succeeded and pre_upgrade_status.content is defined
+
+    - name: Display pre-upgrade status
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          Pre-Upgrade Status: {{ inventory_hostname }}
+          ============================================
+          Current Version: {{ pre_upgrade_version | default('unknown') }}
+          Target Version: {{ xai_version }}
+          Current Height: {{ pre_upgrade_height | default('unknown') }}
+          Upgrade Mode: {{ upgrade_mode }}
+          ============================================
+
+    - name: Check if upgrade is needed
+      ansible.builtin.debug:
+        msg: "Node already at target version {{ xai_version }}. Use -e force_upgrade=true to force."
+      when:
+        - pre_upgrade_version is defined
+        - pre_upgrade_version == xai_version
+        - not force_upgrade | bool
+
+    - name: Skip if already at target version
+      ansible.builtin.meta: end_host
+      when:
+        - pre_upgrade_version is defined
+        - pre_upgrade_version == xai_version
+        - not force_upgrade | bool
+
+    # =========================================================================
+    # Pre-Upgrade Backup
+    # =========================================================================
+    - name: Create backup directory
+      ansible.builtin.file:
+        path: "{{ backup_dir }}"
+        state: directory
+        owner: "{{ daemon_user }}"
+        group: "{{ daemon_user }}"
+        mode: '0755'
+      when: not skip_backup | bool
+
+    - name: Backup current installation
+      community.general.archive:
+        path:
+          - "{{ venv_path }}"
+          - "{{ daemon_home }}/config.yml"
+        dest: "{{ backup_dir }}/xai-backup-{{ ansible_date_time.epoch }}.tar.gz"
+        format: gz
+        owner: "{{ daemon_user }}"
+        group: "{{ daemon_user }}"
+        mode: '0644'
+      when: not skip_backup | bool
+      register: backup_result
+
+    - name: Record backup location
+      ansible.builtin.set_fact:
+        backup_file: "{{ backup_result.dest }}"
+      when: backup_result is defined and backup_result.dest is defined
+
+    # =========================================================================
+    # Stop Service
+    # =========================================================================
+    - name: Stop XAI service
+      ansible.builtin.service:
+        name: "{{ service_name }}"
+        state: stopped
+      register: service_stopped
+
+    - name: Wait for service to stop
+      ansible.builtin.wait_for:
+        port: "{{ rpc_port }}"
+        state: stopped
+        timeout: 60
+
+    # =========================================================================
+    # Perform Upgrade
+    # =========================================================================
+    - name: Upgrade pip and setuptools  # noqa: package-latest
+      ansible.builtin.pip:
+        name:
+          - pip
+          - setuptools
+          - wheel
+        state: latest
+        virtualenv: "{{ venv_path }}"
+      become: true
+      become_user: "{{ daemon_user }}"
+
+    - name: Upgrade XAI package (latest)  # noqa: package-latest
+      ansible.builtin.pip:
+        name: "{{ xai_package | default('xai-blockchain') }}"
+        state: latest
+        virtualenv: "{{ venv_path }}"
+        extra_args: "--upgrade"
+      become: true
+      become_user: "{{ daemon_user }}"
+      when: xai_version == 'latest'
+      register: pip_upgrade_latest
+
+    - name: Upgrade XAI package (specific version)
+      ansible.builtin.pip:
+        name: "{{ xai_package | default('xai-blockchain') }}=={{ xai_version }}"
+        state: present
+        virtualenv: "{{ venv_path }}"
+      become: true
+      become_user: "{{ daemon_user }}"
+      when: xai_version != 'latest'
+      register: pip_upgrade_specific
+
+    # =========================================================================
+    # Post-Upgrade Configuration
+    # =========================================================================
+    - name: Run any database migrations
+      ansible.builtin.command:
+        cmd: "{{ venv_path }}/bin/python -m xai.core.migrate --data-dir {{ daemon_home }}"
+      become: true
+      become_user: "{{ daemon_user }}"
+      register: migration_result
+      changed_when: "'Migrations applied' in migration_result.stdout"
+      failed_when: false
+
+    # =========================================================================
+    # Start Service
+    # =========================================================================
+    - name: Start XAI service
+      ansible.builtin.service:
+        name: "{{ service_name }}"
+        state: started
+      register: service_started
+
+    - name: Wait for node to respond
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ rpc_port }}/stats"
+        return_content: true
+      register: post_upgrade_status
+      until: post_upgrade_status.status == 200
+      retries: 30
+      delay: 5
+      check_mode: false
+
+    # =========================================================================
+    # Post-Upgrade Verification
+    # =========================================================================
+    - name: Set post-upgrade facts
+      ansible.builtin.set_fact:
+        post_upgrade_height: "{{ (post_upgrade_status.content | from_json).chain_height | default(0) }}"
+        post_upgrade_version: "{{ (post_upgrade_status.content | from_json).version | default('unknown') }}"
+      when: post_upgrade_status is succeeded and post_upgrade_status.content is defined
+
+    - name: Verify node is syncing
+      ansible.builtin.assert:
+        that:
+          - post_upgrade_height | int >= pre_upgrade_height | int
+        fail_msg: "Node height decreased after upgrade! Rollback may be needed."
+        success_msg: "Node is syncing correctly after upgrade."
+      when: pre_upgrade_height is defined and post_upgrade_height is defined
+
+    # =========================================================================
+    # Rollback on Failure (if enabled)
+    # =========================================================================
+    - name: Rollback on failure
+      when:
+        - rollback_on_failure | bool
+        - backup_file is defined
+        - post_upgrade_status is failed or (post_upgrade_height | int < pre_upgrade_height | int)
+      block:
+        - name: Stop failed service
+          ansible.builtin.service:
+            name: "{{ service_name }}"
+            state: stopped
+
+        - name: Restore from backup
+          ansible.builtin.unarchive:
+            src: "{{ backup_file }}"
+            dest: /
+            remote_src: true
+          become: true
+          become_user: "{{ daemon_user }}"
+
+        - name: Start restored service
+          ansible.builtin.service:
+            name: "{{ service_name }}"
+            state: started
+
+        - name: Fail with rollback message
+          ansible.builtin.fail:
+            msg: "Upgrade failed. Rolled back to previous version from {{ backup_file }}"
+
+    # =========================================================================
+    # Cleanup
+    # =========================================================================
+    - name: Clean up old backups (keep last 3)
+      ansible.builtin.shell: |
+        set -o pipefail
+        ls -t {{ backup_dir }}/xai-backup-*.tar.gz 2>/dev/null | tail -n +4 | xargs -r rm -f
+      args:
+        executable: /bin/bash
+      changed_when: false
+      when: not skip_backup | bool
+
+    # =========================================================================
+    # Summary
+    # =========================================================================
+    - name: Display upgrade summary
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          XAI Upgrade Complete: {{ inventory_hostname }}
+          ============================================
+          Previous Version: {{ pre_upgrade_version | default('unknown') }}
+          New Version: {{ post_upgrade_version | default('unknown') }}
+          Previous Height: {{ pre_upgrade_height | default('unknown') }}
+          Current Height: {{ post_upgrade_height | default('unknown') }}
+          ============================================
+
+          Backup Location: {{ backup_file | default('skipped') }}
+
+          Service Status:
+            systemctl status {{ service_name }}
+
+          View Logs:
+            journalctl -u {{ service_name }} -f
+          ============================================

@@ -1,0 +1,454 @@
+---
+# XAI Public Endpoints - Nginx reverse proxy for RPC/API/WebSocket
+#
+# Deploys nginx configuration to load-balance public endpoints across sentry nodes.
+# This is the standard blockchain community pattern for exposing public RPC/API.
+#
+# Usage:
+#   ansible-playbook -i inventory/testnet.yml support_public_endpoints.yml --limit xai_sentry1
+#   ansible-playbook -i inventory/testnet.yml support_public_endpoints.yml -e ssl_enabled=true
+#
+# Variables:
+#   ssl_enabled: Enable HTTPS with Let's Encrypt (default: true)
+#   domain_rpc: RPC endpoint domain (default: testnet-rpc.xaiblockchain.com)
+#   domain_api: API endpoint domain (default: testnet-api.xaiblockchain.com)
+#   domain_ws: WebSocket endpoint domain (default: testnet-ws.xaiblockchain.com)
+
+- name: XAI Public Endpoints (Nginx Reverse Proxy)
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    ssl_enabled: true
+    certbot_email: "admin@xaiblockchain.com"
+    domain_rpc: "testnet-rpc.xaiblockchain.com"
+    domain_api: "testnet-api.xaiblockchain.com"
+    domain_ws: "testnet-ws.xaiblockchain.com"
+    domain_graphql: "testnet-graphql.xaiblockchain.com"
+    nginx_worker_connections: 4096
+    nginx_keepalive_timeout: 65
+    rate_limit_rpc: "100r/s"
+    rate_limit_api: "50r/s"
+    rate_limit_ws: "20r/s"
+
+  handlers:
+    - name: Reload nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded
+
+    - name: Restart nginx
+      ansible.builtin.service:
+        name: nginx
+        state: restarted
+
+  tasks:
+    # =========================================================================
+    # Prerequisites
+    # =========================================================================
+    - name: Install nginx and certbot
+      ansible.builtin.apt:
+        name:
+          - nginx
+          - certbot
+          - python3-certbot-nginx
+        state: present
+        update_cache: true
+
+    - name: Create nginx directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      loop:
+        - /etc/nginx/sites-available
+        - /etc/nginx/sites-enabled
+        - /etc/nginx/conf.d
+        - /var/log/nginx/xai
+
+    # =========================================================================
+    # Upstream Configuration (Sentry Load Balancing)
+    # =========================================================================
+    - name: Deploy upstream configuration
+      ansible.builtin.copy:
+        content: |
+          # XAI Upstream Backends
+          # Load balance across sentry nodes for high availability
+
+          # RPC backends (XAI native RPC)
+          upstream xai_rpc {
+              least_conn;
+              server 127.0.0.1:{{ rpc_port }} weight=5;
+              {% if hostvars['xai_sentry2'] is defined %}
+              server {{ hostvars['xai_sentry2'].vpn_ip | default('10.10.0.3') }}:{{ hostvars['xai_sentry2'].rpc_port | default(12571) }} weight=5 backup;
+              {% endif %}
+              keepalive 32;
+          }
+
+          # API backends (REST API)
+          upstream xai_api {
+              least_conn;
+              server 127.0.0.1:{{ api_port | default(rpc_port) }};
+              {% if hostvars['xai_sentry2'] is defined %}
+              {% set s2_port = hostvars['xai_sentry2'].api_port | default(12571) %}
+              server {{ hostvars['xai_sentry2'].vpn_ip | default('10.10.0.3') }}:{{ s2_port }} backup;
+              {% endif %}
+              keepalive 32;
+          }
+
+          # WebSocket backends
+          upstream xai_websocket {
+              least_conn;
+              server 127.0.0.1:{{ ws_port | default(8766) }};
+              keepalive 32;
+          }
+
+          # GraphQL backends
+          upstream xai_graphql {
+              server 127.0.0.1:{{ graphql_port | default(8083) }};
+              keepalive 16;
+          }
+        dest: /etc/nginx/conf.d/xai-upstreams.conf
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reload nginx
+
+    # =========================================================================
+    # Rate Limiting Configuration
+    # =========================================================================
+    - name: Deploy rate limiting configuration
+      ansible.builtin.copy:
+        content: |
+          # XAI Rate Limiting Zones
+          # Protect against DDoS and abuse
+
+          limit_req_zone $binary_remote_addr zone=xai_rpc_limit:10m rate={{ rate_limit_rpc }};
+          limit_req_zone $binary_remote_addr zone=xai_api_limit:10m rate={{ rate_limit_api }};
+          limit_req_zone $binary_remote_addr zone=xai_ws_limit:10m rate={{ rate_limit_ws }};
+
+          # Connection limits
+          limit_conn_zone $binary_remote_addr zone=xai_conn_limit:10m;
+        dest: /etc/nginx/conf.d/xai-ratelimit.conf
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reload nginx
+
+    # =========================================================================
+    # RPC Endpoint Configuration
+    # =========================================================================
+    - name: Deploy RPC site configuration
+      ansible.builtin.copy:
+        content: |
+          # XAI RPC Endpoint - {{ domain_rpc }}
+          server {
+              listen 80;
+              server_name {{ domain_rpc }};
+
+              access_log /var/log/nginx/xai/rpc-access.log;
+              error_log /var/log/nginx/xai/rpc-error.log;
+
+              # Rate limiting
+              limit_req zone=xai_rpc_limit burst=200 nodelay;
+              limit_conn xai_conn_limit 100;
+
+              location / {
+                  proxy_pass http://xai_rpc;
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+
+                  # Timeouts
+                  proxy_connect_timeout 10s;
+                  proxy_send_timeout 30s;
+                  proxy_read_timeout 30s;
+
+                  # CORS headers
+                  add_header Access-Control-Allow-Origin * always;
+                  add_header Access-Control-Allow-Methods "GET, POST, OPTIONS" always;
+                  add_header Access-Control-Allow-Headers "Content-Type, Authorization" always;
+
+                  if ($request_method = OPTIONS) {
+                      return 204;
+                  }
+              }
+
+              # Health check endpoint
+              location /health {
+                  access_log off;
+                  proxy_pass http://xai_rpc/stats;
+                  proxy_http_version 1.1;
+              }
+          }
+        dest: /etc/nginx/sites-available/xai-rpc.conf
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reload nginx
+
+    # =========================================================================
+    # API Endpoint Configuration
+    # =========================================================================
+    - name: Deploy API site configuration
+      ansible.builtin.copy:
+        content: |
+          # XAI API Endpoint - {{ domain_api }}
+          server {
+              listen 80;
+              server_name {{ domain_api }};
+
+              access_log /var/log/nginx/xai/api-access.log;
+              error_log /var/log/nginx/xai/api-error.log;
+
+              # Rate limiting
+              limit_req zone=xai_api_limit burst=100 nodelay;
+              limit_conn xai_conn_limit 50;
+
+              location / {
+                  proxy_pass http://xai_api;
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+
+                  # Timeouts
+                  proxy_connect_timeout 10s;
+                  proxy_send_timeout 60s;
+                  proxy_read_timeout 60s;
+
+                  # CORS headers
+                  add_header Access-Control-Allow-Origin * always;
+                  add_header Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS" always;
+                  add_header Access-Control-Allow-Headers "Content-Type, Authorization" always;
+
+                  if ($request_method = OPTIONS) {
+                      return 204;
+                  }
+              }
+
+              # Health check
+              location /health {
+                  access_log off;
+                  return 200 "OK";
+                  add_header Content-Type text/plain;
+              }
+          }
+        dest: /etc/nginx/sites-available/xai-api.conf
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reload nginx
+
+    # =========================================================================
+    # WebSocket Endpoint Configuration
+    # =========================================================================
+    - name: Deploy WebSocket site configuration
+      ansible.builtin.copy:
+        content: |
+          # XAI WebSocket Endpoint - {{ domain_ws }}
+          server {
+              listen 80;
+              server_name {{ domain_ws }};
+
+              access_log /var/log/nginx/xai/ws-access.log;
+              error_log /var/log/nginx/xai/ws-error.log;
+
+              # Rate limiting
+              limit_req zone=xai_ws_limit burst=50 nodelay;
+              limit_conn xai_conn_limit 200;
+
+              location / {
+                  proxy_pass http://xai_websocket;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+
+                  # WebSocket timeouts (longer for persistent connections)
+                  proxy_connect_timeout 10s;
+                  proxy_send_timeout 86400s;
+                  proxy_read_timeout 86400s;
+
+                  # Disable buffering for real-time
+                  proxy_buffering off;
+              }
+          }
+        dest: /etc/nginx/sites-available/xai-ws.conf
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reload nginx
+
+    # =========================================================================
+    # GraphQL Endpoint Configuration
+    # =========================================================================
+    - name: Deploy GraphQL site configuration
+      ansible.builtin.copy:
+        content: |
+          # XAI GraphQL Endpoint - {{ domain_graphql }}
+          server {
+              listen 80;
+              server_name {{ domain_graphql }};
+
+              access_log /var/log/nginx/xai/graphql-access.log;
+              error_log /var/log/nginx/xai/graphql-error.log;
+
+              # Rate limiting
+              limit_req zone=xai_api_limit burst=50 nodelay;
+              limit_conn xai_conn_limit 50;
+
+              location / {
+                  proxy_pass http://xai_graphql;
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+
+                  # GraphQL typically uses POST
+                  proxy_connect_timeout 10s;
+                  proxy_send_timeout 30s;
+                  proxy_read_timeout 30s;
+
+                  # CORS headers
+                  add_header Access-Control-Allow-Origin * always;
+                  add_header Access-Control-Allow-Methods "GET, POST, OPTIONS" always;
+                  add_header Access-Control-Allow-Headers "Content-Type, Authorization" always;
+
+                  if ($request_method = OPTIONS) {
+                      return 204;
+                  }
+              }
+
+              # GraphQL Playground/Explorer
+              location /graphql {
+                  proxy_pass http://xai_graphql/graphql;
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+              }
+          }
+        dest: /etc/nginx/sites-available/xai-graphql.conf
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reload nginx
+
+    # =========================================================================
+    # Enable Sites
+    # =========================================================================
+    - name: Enable XAI nginx sites
+      ansible.builtin.file:
+        src: "/etc/nginx/sites-available/{{ item }}"
+        dest: "/etc/nginx/sites-enabled/{{ item }}"
+        state: link
+      loop:
+        - xai-rpc.conf
+        - xai-api.conf
+        - xai-ws.conf
+        - xai-graphql.conf
+      notify: Reload nginx
+
+    - name: Remove default nginx site
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: Reload nginx
+
+    # =========================================================================
+    # SSL/TLS with Let's Encrypt
+    # =========================================================================
+    - name: Obtain SSL certificates with certbot
+      ansible.builtin.command:
+        cmd: >
+          certbot --nginx -d {{ item }}
+          --non-interactive --agree-tos
+          --email {{ certbot_email }}
+          --redirect
+      loop:
+        - "{{ domain_rpc }}"
+        - "{{ domain_api }}"
+        - "{{ domain_ws }}"
+        - "{{ domain_graphql }}"
+      when: ssl_enabled | bool
+      register: certbot_result
+      changed_when: "'Successfully received certificate' in certbot_result.stdout"
+      failed_when: false
+
+    - name: Setup certbot auto-renewal cron
+      ansible.builtin.cron:
+        name: "Certbot auto-renewal"
+        minute: "0"
+        hour: "3"
+        job: "certbot renew --quiet --post-hook 'systemctl reload nginx'"
+        user: root
+      when: ssl_enabled | bool
+
+    # =========================================================================
+    # Firewall Configuration
+    # =========================================================================
+    - name: Allow HTTP through UFW
+      community.general.ufw:
+        rule: allow
+        port: "80"
+        proto: tcp
+
+    - name: Allow HTTPS through UFW
+      community.general.ufw:
+        rule: allow
+        port: "443"
+        proto: tcp
+      when: ssl_enabled | bool
+
+    # =========================================================================
+    # Enable and Start Nginx
+    # =========================================================================
+    - name: Test nginx configuration
+      ansible.builtin.command:
+        cmd: nginx -t
+      register: nginx_test
+      changed_when: false
+
+    - name: Enable and start nginx
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: true
+
+    # =========================================================================
+    # Verification
+    # =========================================================================
+    - name: Display public endpoints configuration
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          XAI Public Endpoints Configured
+          ============================================
+          Server: {{ inventory_hostname }}
+          SSL Enabled: {{ ssl_enabled }}
+          ============================================
+
+          Endpoints:
+            RPC: {{ 'https' if ssl_enabled else 'http' }}://{{ domain_rpc }}
+            API: {{ 'https' if ssl_enabled else 'http' }}://{{ domain_api }}
+            WebSocket: {{ 'wss' if ssl_enabled else 'ws' }}://{{ domain_ws }}
+            GraphQL: {{ 'https' if ssl_enabled else 'http' }}://{{ domain_graphql }}
+
+          Rate Limits:
+            RPC: {{ rate_limit_rpc }}
+            API: {{ rate_limit_api }}
+            WebSocket: {{ rate_limit_ws }}
+
+          Health Check:
+            curl {{ 'https' if ssl_enabled else 'http' }}://{{ domain_rpc }}/health
+          ============================================
