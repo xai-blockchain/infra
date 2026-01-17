@@ -28,7 +28,8 @@
     service_name: "xai-mvp-{{ node_name }}"
 
   handlers:
-    - name: Rollback on failure
+    - name: rollback deployment
+      listen: rollback deployment
       block:
         - name: Stop failed node
           ansible.builtin.service:
@@ -62,7 +63,6 @@
           until: rollback_status.status == 200
           retries: 10
           delay: 5
-      listen: "rollback deployment"
 
   pre_tasks:
     - name: Display deployment info
